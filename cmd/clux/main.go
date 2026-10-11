@@ -1,7 +1,12 @@
 // clux is the BYOC (bring-your-own-compute) host agent: it registers this
 // machine's CPU/memory/storage with a Clux backend and keeps it marked
-// online over a long-lived tunnel connection. See internal/tunnel for the
-// wire protocol and internal/sysinfo for the capacity numbers reported.
+// online over a long-lived tunnel connection. Once registered, `host start`
+// also answers workspace.start/stop/delete lifecycle commands (docker
+// run/stop/rm against this machine's own Docker daemon, see
+// internal/dockerhost) and proxies dial.open/data/close stream frames to
+// locally-published container ports (internal/dialproxy), all multiplexed
+// over that same connection -- see internal/tunnel for the wire protocol
+// and internal/sysinfo for the capacity numbers reported.
 package main
 
 import (
@@ -15,12 +20,13 @@ import (
 	"time"
 
 	"github.com/eduardkumskyi/clux-cli/internal/config"
+	"github.com/eduardkumskyi/clux-cli/internal/hostsession"
 	"github.com/eduardkumskyi/clux-cli/internal/sysinfo"
 	"github.com/eduardkumskyi/clux-cli/internal/tunnel"
 )
 
 const (
-	version           = "0.1.0"
+	version           = "0.2.0"
 	defaultBackendURL = "https://app.clux.space"
 	defaultHeartbeat  = 30 * time.Second
 	reconnectBackoff  = 5 * time.Second
@@ -207,6 +213,12 @@ func runHostStart(args []string) error {
 	}
 }
 
+// runSession holds one tunnel connection open for the duration of its
+// lifetime: register, then enter the full-duplex loop (tunnel.Session.Run)
+// where a background goroutine ticks heartbeats into the same outbox that
+// lifecycle command results and dial frames flow through, while the
+// connection's reader dispatches whatever the backend pushes
+// (workspace.start/stop/delete, dial.open/data/close) to hostsession.Handler.
 func runSession(ctx context.Context, cfg *config.Config, interval time.Duration) error {
 	info, err := sysinfo.Collect(config.DefaultStorageRoot())
 	if err != nil {
@@ -220,20 +232,27 @@ func runSession(ctx context.Context, cfg *config.Config, interval time.Duration)
 	defer sess.Close()
 	fmt.Printf("registered as host %q (id=%d)\n", sess.Name, sess.HostID)
 
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return nil
-		case <-ticker.C:
-			info, err := sysinfo.Collect(config.DefaultStorageRoot())
-			if err != nil {
-				return fmt.Errorf("collecting system info: %w", err)
-			}
-			if err := sess.Heartbeat(info, version); err != nil {
-				return err
+	sessionCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	go func() {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-sessionCtx.Done():
+				return
+			case <-ticker.C:
+				info, err := sysinfo.Collect(config.DefaultStorageRoot())
+				if err != nil {
+					fmt.Fprintln(os.Stderr, "clux: collecting system info for heartbeat:", err)
+					continue
+				}
+				sess.SendHeartbeat(info, version)
 			}
 		}
-	}
+	}()
+
+	handler := hostsession.New(sess)
+	return sess.Run(sessionCtx, handler)
 }
