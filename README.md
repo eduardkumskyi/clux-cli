@@ -23,6 +23,20 @@ clux host start               # register this machine and keep it online (foregr
 
 Run `clux help` for the full command list.
 
+## Commands
+
+| Command | Flags | Description |
+| --- | --- | --- |
+| `clux login` | `--token <PAT>` (required)<br>`--backend-url <url>` (default `https://app.clux.space`) | Verifies the token against the backend and stores credentials locally. |
+| `clux logout` | none | Removes stored credentials. |
+| `clux whoami` | none | Shows the identity of the currently configured host (dials the backend to re-verify stored credentials). |
+| `clux doctor` | none | Checks the local environment: Docker CLI reachability, whether the Docker daemon can actually run CPU/memory resource-limited containers (catches cgroup v2 "threaded mode" setups that reject `--cpus`/`--memory` before a workspace start fails the same way), stored credentials, system info collection, and backend connectivity. |
+| `clux host start` | `--interval <duration>` (default `30s`) | Registers this machine and keeps it online in the foreground: opens the tunnel, sends heartbeats on the given interval, and answers workspace lifecycle commands from the backend. Reconnects automatically on a 5s backoff if the connection drops. Exits cleanly on SIGINT/SIGTERM. |
+| `clux version` | none | Prints the CLI version. |
+| `clux help` (also `-h`, `--help`) | none | Prints usage. |
+
+Running `clux` with no arguments also prints usage and exits non-zero.
+
 ## How it works
 
 `clux host start` dials out to the Clux backend over a WebSocket and keeps
