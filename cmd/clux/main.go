@@ -16,6 +16,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -160,6 +161,7 @@ func runDoctor(args []string) error {
 	}
 
 	check("docker CLI reachable", exec.Command("docker", "version").Run())
+	check("docker can run resource-limited containers", checkDockerResourceLimits())
 
 	cfg, cfgErr := config.Load()
 	check("credentials configured", cfgErr)
@@ -181,6 +183,27 @@ func runDoctor(args []string) error {
 	}
 	fmt.Println("all checks passed")
 	return nil
+}
+
+// checkDockerResourceLimits verifies the Docker daemon will actually honor
+// --cpus/--memory, the exact flags dockerhost.Start passes on every
+// workspace.start (see internal/dockerhost/lifecycle.go). Some nested/
+// sandboxed Docker setups run cgroup v2 in "threaded" mode, which rejects
+// these flags outright -- and since every workspace start uses them, that
+// failure mode would otherwise only surface the first time a user tries to
+// start a workspace, not here at doctor time where it's actionable.
+func checkDockerResourceLimits() error {
+	out, err := exec.Command("docker", "run", "--rm", "--cpus", "0.1", "--memory", "64m", "busybox", "true").CombinedOutput()
+	if err == nil {
+		return nil
+	}
+
+	msg := string(out)
+	if strings.Contains(msg, "cgroup") && (strings.Contains(msg, "threaded mode") || strings.Contains(msg, "domain controllers")) {
+		return fmt.Errorf("docker daemon's cgroup v2 is in \"threaded\" mode and rejects --cpus/--memory -- every workspace start will fail the same way (docker said: %s)", strings.TrimSpace(msg))
+	}
+
+	return fmt.Errorf("docker run with --cpus/--memory failed -- either the busybox test image couldn't be pulled, or this docker daemon doesn't support CPU/memory resource limits (both would break every workspace start): %s", strings.TrimSpace(msg))
 }
 
 func runHostStart(args []string) error {
