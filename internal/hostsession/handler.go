@@ -89,8 +89,8 @@ func dispatchCommand(ctx context.Context, frameType string, frame map[string]any
 
 // HandleDialOpen implements tunnel.Handler. Already invoked in its own
 // goroutine by Session.Run's reader loop.
-func (h *Handler) HandleDialOpen(ctx context.Context, streamID string, port int) {
-	h.dials.Open(ctx, streamID, port, h.sess.Send)
+func (h *Handler) HandleDialOpen(ctx context.Context, streamID string, port int, secret string) {
+	h.dials.Open(ctx, streamID, port, secret, h.sess.Send)
 }
 
 // HandleDialData implements tunnel.Handler.

@@ -154,8 +154,10 @@ type Handler interface {
 	HandleCommand(ctx context.Context, frameType string, frame map[string]any)
 	// HandleDialOpen processes one dial.open frame (new stream_id); it owns
 	// registering the stream for subsequent HandleDialData/HandleDialClose
-	// routing and sending dial.ready/dial.error.
-	HandleDialOpen(ctx context.Context, streamID string, port int)
+	// routing and sending dial.ready/dial.error. secret is the workspace's
+	// HMAC secret (dial.open's "secret" field) to present when dialing the
+	// sidecar's own WebSocket auth check.
+	HandleDialOpen(ctx context.Context, streamID string, port int, secret string)
 	// HandleDialData routes one dial.data frame's base64 payload to the
 	// stream's pump, if registered.
 	HandleDialData(streamID string, dataB64 string)
@@ -253,7 +255,8 @@ func (s *Session) readLoop(ctx context.Context, h Handler) error {
 		case "dial.open":
 			streamID, _ := raw["stream_id"].(string)
 			port, _ := raw["port"].(float64)
-			go h.HandleDialOpen(ctx, streamID, int(port))
+			secret, _ := raw["secret"].(string)
+			go h.HandleDialOpen(ctx, streamID, int(port), secret)
 		case "dial.data":
 			streamID, _ := raw["stream_id"].(string)
 			data, _ := raw["data"].(string)

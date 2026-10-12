@@ -1,33 +1,40 @@
 // Package dialproxy implements the CLI side of dial.open/data/close stream
-// multiplexing: proxying bytes between the backend (over the tunnel
-// connection, as base64 dial.data frames) and a local TCP connection to a
-// Docker-published port on this host (see backend/apps/workspaces/services/
-// byoc_transport.py's TunnelSidecarTransport for the backend side).
+// multiplexing: proxying WebSocket messages between the backend (over the
+// tunnel connection, as base64 dial.data frames) and a real WebSocket
+// connection to the sidecar's Docker-published port on this host (see
+// backend/apps/workspaces/services/byoc_transport.py's
+// TunnelSidecarTransport for the backend side).
 //
-// Each open stream gets its own goroutine reading from the local TCP conn
-// and forwarding chunks as dial.data frames; inbound dial.data/dial.close
-// frames for that stream_id are routed to it through a small buffered
-// channel rather than a direct function call, so the tunnel's single
-// reader loop never blocks on a slow/stuck local connection.
+// This dials the sidecar's actual WebSocket protocol server (ws://127.0.0.1
+// :<port>), not a raw TCP byte pipe -- the sidecar expects a real WS
+// handshake (including the X-Sidecar-Secret auth header) and WS-framed
+// messages, the same as it would get from the direct AWS/SidecarClient
+// path. One dial.data frame carries exactly one complete WS message
+// (base64 of its full payload), never an arbitrary byte chunk: the
+// backend's TunnelSidecarTransport.recv() returns one dial.data's payload
+// per call expecting a complete JSON message, so splitting a message
+// across frames would break json.loads() on the far end.
+//
+// Each open stream gets its own goroutine reading messages from the local
+// WS connection and forwarding them as dial.data frames; inbound dial.data/
+// dial.close frames for that stream_id are routed to it through a small
+// buffered channel rather than a direct function call, so the tunnel's
+// single reader loop never blocks on a slow/stuck local connection.
 package dialproxy
 
 import (
 	"context"
 	"encoding/base64"
 	"fmt"
-	"net"
+	"net/http"
 	"sync"
 	"time"
+
+	"github.com/gorilla/websocket"
 )
 
-// readChunkSize bounds how much is read from the local connection per
-// dial.data frame. Arbitrary but reasonable: big enough to not fragment
-// bulk transfers into a flood of tiny frames, small enough to keep each
-// frame's base64 payload a modest size over the websocket.
-const readChunkSize = 32 * 1024
-
-// dialTimeout bounds how long a local TCP dial is allowed to take before
-// it's reported back as a dial.error.
+// dialTimeout bounds how long the local WebSocket handshake is allowed to
+// take before it's reported back as a dial.error.
 const dialTimeout = 5 * time.Second
 
 // Registry tracks open streams by stream_id so inbound dial.data/dial.close
@@ -43,24 +50,29 @@ func NewRegistry() *Registry {
 }
 
 type stream struct {
-	conn net.Conn
-	// inbound carries dial.data payloads (decoded) and a nil-slice sentinel
-	// is not used; close is signaled separately via closeCh so a zero-length
-	// data frame (legal, if unlikely) isn't mistaken for EOF.
+	conn *websocket.Conn
+	// inbound carries whole decoded message payloads; close is signaled
+	// separately via closeCh so a zero-length message (legal, if unlikely)
+	// isn't mistaken for a close.
 	inbound chan []byte
 	closeCh chan struct{}
 }
 
-// Open handles one dial.open frame: dials the local port, reports
-// dial.ready/dial.error via send, and if successful registers the stream
-// and starts the read-pump goroutine that forwards local bytes out as
-// dial.data frames. send must be safe for concurrent use from multiple
-// streams (tunnel.Session.Send already is).
-func (r *Registry) Open(ctx context.Context, streamID string, port int, send func(frame any)) {
+// Open handles one dial.open frame: dials the sidecar's WebSocket port
+// (presenting secret as X-Sidecar-Secret, exactly like the backend's
+// direct-socket SidecarClient path does), reports dial.ready/dial.error via
+// send, and if successful registers the stream and starts the read-pump
+// goroutine that forwards inbound messages out as dial.data frames. send
+// must be safe for concurrent use from multiple streams (tunnel.Session.Send
+// already is).
+func (r *Registry) Open(ctx context.Context, streamID string, port int, secret string, send func(frame any)) {
 	dialCtx, cancel := context.WithTimeout(ctx, dialTimeout)
 	defer cancel()
 
-	conn, err := (&net.Dialer{}).DialContext(dialCtx, "tcp", fmt.Sprintf("127.0.0.1:%d", port))
+	url := fmt.Sprintf("ws://127.0.0.1:%d", port)
+	header := http.Header{"X-Sidecar-Secret": []string{secret}}
+	dialer := websocket.Dialer{HandshakeTimeout: dialTimeout}
+	conn, _, err := dialer.DialContext(dialCtx, url, header)
 	if err != nil {
 		send(map[string]any{"type": "dial.error", "stream_id": streamID, "message": err.Error()})
 		return
@@ -76,14 +88,12 @@ func (r *Registry) Open(ctx context.Context, streamID string, port int, send fun
 	go r.pump(ctx, streamID, st, send)
 }
 
-// Data routes one decoded-later dial.data frame's base64 payload to the
-// stream's inbound queue, writing it to the local connection. Called
-// synchronously from the tunnel's reader loop, so it must not block: the
-// local connection write happens in a short-lived goroutine-free fast path
-// only if the stream exists, and is itself a plain conn.Write -- a stuck
-// local peer could in principle block this, but that mirrors the original
-// backend's own blocking write semantics and keeping a bounded inbound
-// channel here would only defer the problem while still bounding memory.
+// Data routes one decoded dial.data frame's base64 payload (a whole WS
+// message) to the stream's inbound queue, to be written as one WriteMessage
+// call. Called synchronously from the tunnel's reader loop, so it must not
+// block: this is a channel send, not the write itself (that happens in
+// pump's writer goroutine) -- a stuck local peer blocks that goroutine, not
+// this one, bounded by the channel's buffer.
 func (r *Registry) Data(streamID, dataB64 string) {
 	r.mu.Lock()
 	st := r.streams[streamID]
@@ -117,12 +127,24 @@ func (r *Registry) Close(streamID string) {
 	case st.closeCh <- struct{}{}:
 	default:
 	}
-	_ = st.conn.Close()
+	closeGracefully(st.conn)
 }
 
-// pump owns the stream's lifetime: one goroutine writes inbound frames to
-// the local conn (fed by Data) and reads from the local conn to emit
-// outbound dial.data frames, until either side closes or errors.
+// closeGracefully sends a WS close frame before dropping the TCP
+// connection. Skipping it still works, but it spams the sidecar's own
+// logs with "connection closed without proper close handshake" warnings
+// on every stream teardown -- same rationale as tunnel.Session.Close.
+func closeGracefully(conn *websocket.Conn) {
+	deadline := time.Now().Add(time.Second)
+	_ = conn.WriteControl(websocket.CloseMessage,
+		websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""), deadline)
+	_ = conn.Close()
+}
+
+// pump owns the stream's lifetime: one goroutine writes inbound messages to
+// the local WS conn (fed by Data) and reads whole messages from the local
+// WS conn to emit outbound dial.data frames, until either side closes or
+// errors.
 func (r *Registry) pump(ctx context.Context, streamID string, st *stream, send func(frame any)) {
 	writeDone := make(chan struct{})
 	go func() {
@@ -130,7 +152,7 @@ func (r *Registry) pump(ctx context.Context, streamID string, st *stream, send f
 		for {
 			select {
 			case raw := <-st.inbound:
-				if _, err := st.conn.Write(raw); err != nil {
+				if err := st.conn.WriteMessage(websocket.TextMessage, raw); err != nil {
 					return
 				}
 			case <-st.closeCh:
@@ -141,14 +163,13 @@ func (r *Registry) pump(ctx context.Context, streamID string, st *stream, send f
 		}
 	}()
 
-	buf := make([]byte, readChunkSize)
 	for {
-		n, err := st.conn.Read(buf)
-		if n > 0 {
+		_, data, err := st.conn.ReadMessage()
+		if len(data) > 0 {
 			send(map[string]any{
 				"type":      "dial.data",
 				"stream_id": streamID,
-				"data":      base64.StdEncoding.EncodeToString(buf[:n]),
+				"data":      base64.StdEncoding.EncodeToString(data),
 			})
 		}
 		if err != nil {
@@ -167,7 +188,7 @@ func (r *Registry) pump(ctx context.Context, streamID string, st *stream, send f
 	case st.closeCh <- struct{}{}:
 	default:
 	}
-	_ = st.conn.Close()
+	closeGracefully(st.conn)
 	<-writeDone
 
 	if stillOpen {
