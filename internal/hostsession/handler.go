@@ -7,6 +7,7 @@ package hostsession
 import (
 	"context"
 	"fmt"
+	"log"
 
 	"github.com/eduardkumskyi/clux-cli/internal/dialproxy"
 	"github.com/eduardkumskyi/clux-cli/internal/dockerhost"
@@ -36,9 +37,15 @@ func (h *Handler) HandleCommand(ctx context.Context, frameType string, frame map
 
 	extra, err := dispatchCommand(ctx, frameType, frame)
 	if err != nil {
+		// Surface the failure locally too — otherwise the only trace is the
+		// result frame sent back to the backend, and the operator watching
+		// `clux host start` sees nothing while the dashboard shows a generic
+		// "Workspace failed to start".
+		log.Printf("command %s failed: %v", frameType, err)
 		result["ok"] = false
 		result["error"] = err.Error()
 	} else {
+		log.Printf("command %s ok", frameType)
 		result["ok"] = true
 		for k, v := range extra {
 			result[k] = v
