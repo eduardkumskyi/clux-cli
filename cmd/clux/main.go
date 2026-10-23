@@ -26,8 +26,10 @@ import (
 	"github.com/eduardkumskyi/clux-cli/internal/tunnel"
 )
 
+// version is overridden at release time via -ldflags "-X main.version=...".
+var version = "0.2.0"
+
 const (
-	version           = "0.2.0"
 	defaultBackendURL = "https://app.clux.space"
 	defaultHeartbeat  = 30 * time.Second
 	reconnectBackoff  = 5 * time.Second

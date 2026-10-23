@@ -1,0 +1,56 @@
+# GoReleaser builds cross-platform `clux` binaries and publishes them to a
+# GitHub Release on every pushed `vX.Y.Z` tag. See .github/workflows/release.yml.
+version: 2
+
+project_name: clux
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: clux
+    main: ./cmd/clux
+    binary: clux
+    env:
+      - CGO_ENABLED=0
+    ldflags:
+      - -s -w -X main.version={{ .Tag }}
+    goos:
+      - linux
+      - darwin
+      - windows
+    goarch:
+      - amd64
+      - arm64
+
+archives:
+  # Version-less archive names so install.sh can fetch a stable filename
+  # without first resolving the release version.
+  - id: clux
+    name_template: "clux_{{ .Os }}_{{ .Arch }}"
+    format_overrides:
+      - goos: windows
+        format: zip
+    files:
+      - LICENSE
+      - README.md
+
+checksum:
+  name_template: "checksums.txt"
+
+release:
+  github:
+    owner: eduardkumskyi
+    name: clux-cli
+  draft: false
+  prerelease: auto
+
+changelog:
+  use: github
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^chore:"
