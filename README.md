@@ -41,7 +41,7 @@ Run `clux help` for the full command list.
 
 | Command | Flags | Description |
 | --- | --- | --- |
-| `clux login` | `--token <PAT>` (required)<br>`--backend-url <url>` (default `https://app.clux.space`) | Verifies the token against the backend and stores credentials locally. |
+| `clux login` | `--token <PAT>` (required)<br>`--backend-url <url>` (default `https://api.clux.space`) | Verifies the token against the backend and stores credentials locally. |
 | `clux logout` | none | Removes stored credentials. |
 | `clux whoami` | none | Shows the identity of the currently configured host (dials the backend to re-verify stored credentials). |
 | `clux doctor` | none | Checks the local environment: Docker CLI reachability, whether the Docker daemon can actually run CPU/memory resource-limited containers (catches cgroup v2 "threaded mode" setups that reject `--cpus`/`--memory` before a workspace start fails the same way), stored credentials, system info collection, and backend connectivity. |

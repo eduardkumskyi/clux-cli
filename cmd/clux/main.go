@@ -30,7 +30,10 @@ import (
 var version = "0.2.0"
 
 const (
-	defaultBackendURL = "https://app.clux.space"
+	// The backend (Django/Channels) is served at api.clux.space via the
+	// Cloudflare tunnel; app.clux.space is the SPA only and answers every
+	// /ws/ path with index.html (-> "bad handshake").
+	defaultBackendURL = "https://api.clux.space"
 	defaultHeartbeat  = 30 * time.Second
 	reconnectBackoff  = 5 * time.Second
 )
