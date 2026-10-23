@@ -6,12 +6,26 @@ already pay for — to offer its CPU, memory, and disk as a workspace host.
 
 ## Install
 
+No Go toolchain required — the install script grabs a prebuilt binary for your
+OS and architecture (macOS/Linux, amd64/arm64):
+
+```
+curl -fsSL https://clux.space/install.sh | sh
+```
+
+It installs to `/usr/local/bin` (or `~/.local/bin` if that isn't writable).
+Set `CLUX_INSTALL_DIR` to pick another location, or `CLUX_VERSION=vX.Y.Z` to
+pin a release.
+
+**Manual download:** grab the archive for your platform from the
+[releases page](https://github.com/eduardkumskyi/clux-cli/releases), unpack it,
+and move the `clux` binary onto your `PATH`. On Windows, download the `.zip`.
+
+**From source** (needs Go 1.23+):
+
 ```
 go install github.com/eduardkumskyi/clux-cli/cmd/clux@latest
 ```
-
-Or download a prebuilt binary from the
-[releases page](https://github.com/eduardkumskyi/clux-cli/releases).
 
 ## Usage
 
