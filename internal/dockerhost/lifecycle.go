@@ -90,6 +90,15 @@ func Start(ctx context.Context, req StartRequest) (StartResult, error) {
 		return StartResult{}, err
 	}
 
+	// Remove any stale container with this exact managed name before running a
+	// fresh one. A workspace that errored or was force-stopped can leave its
+	// container behind; without this, `docker run --name` fails with a name
+	// conflict on every retry ("container name ... is already in use"), so the
+	// workspace can never recover. stopAndRemove treats "no such container" as
+	// success, so this is a no-op on a clean first start. The per-workspace
+	// data volume is separate and untouched, so no user data is lost.
+	_ = stopAndRemove(ctx, req.ContainerName)
+
 	args := []string{
 		"run", "-d",
 		"--name", req.ContainerName,
