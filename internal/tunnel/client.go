@@ -18,6 +18,7 @@ package tunnel
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"net/url"
 	"time"
 
@@ -62,8 +63,17 @@ func Dial(ctx context.Context, backendURL, token, cliVersion string, info sysinf
 		return nil, err
 	}
 
+	// Channels' AllowedHostsOriginValidator (enabled in prod) rejects a
+	// handshake whose Origin host isn't in ALLOWED_HOSTS; a header-less dial
+	// gets HTTP 403 ("bad handshake"). Send the backend's own origin, which
+	// is always an allowed host.
+	reqHeader, err := originHeader(backendURL)
+	if err != nil {
+		return nil, err
+	}
+
 	dialer := websocket.Dialer{HandshakeTimeout: 10 * time.Second}
-	conn, _, err := dialer.DialContext(ctx, wsURL, nil)
+	conn, _, err := dialer.DialContext(ctx, wsURL, reqHeader)
 	if err != nil {
 		return nil, fmt.Errorf("connecting to %s: %w", wsURL, err)
 	}
@@ -289,4 +299,21 @@ func toWebsocketURL(backendURL string) (string, error) {
 	}
 	u.Path = hostWebsocketPath
 	return u.String(), nil
+}
+
+// originHeader returns the Origin request header the backend's origin
+// validator expects: the http(s) origin (scheme://host) of backendURL. The
+// backend host is always in ALLOWED_HOSTS, so this passes validation.
+func originHeader(backendURL string) (http.Header, error) {
+	u, err := url.Parse(backendURL)
+	if err != nil {
+		return nil, fmt.Errorf("parsing backend URL %q: %w", backendURL, err)
+	}
+	switch u.Scheme {
+	case "ws":
+		u.Scheme = "http"
+	case "wss":
+		u.Scheme = "https"
+	}
+	return http.Header{"Origin": {u.Scheme + "://" + u.Host}}, nil
 }
