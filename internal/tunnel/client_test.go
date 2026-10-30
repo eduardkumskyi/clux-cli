@@ -24,10 +24,11 @@ func (nopHandler) HandleDialClose(string)                                {}
 
 // fakeBackend registers the CLI, then behaves per mode.
 type fakeBackend struct {
-	mode string // "silent" (half-open: stop reading, never pong), "alive", "restart", "reject_outdated"
-	srv  *httptest.Server
-	mu   sync.Mutex
-	conn *websocket.Conn
+	mode      string // "silent" (half-open: stop reading, never pong), "alive", "restart", "reject_outdated"
+	srv       *httptest.Server
+	mu        sync.Mutex
+	conn      *websocket.Conn
+	closeCode int
 }
 
 func newFakeBackend(t *testing.T, mode string) *fakeBackend {
@@ -46,6 +47,10 @@ func newFakeBackend(t *testing.T, mode string) *fakeBackend {
 		if err := c.ReadJSON(&reg); err != nil {
 			return
 		}
+		if fb.mode == "reject_unknown" {
+			_ = c.WriteJSON(map[string]any{"type": "register_rejected", "reason": "maintenance"})
+			return
+		}
 		if fb.mode == "reject_outdated" {
 			_ = c.WriteJSON(map[string]any{"type": "register_rejected", "reason": "cli_outdated", "min_version": "9.9.9"})
 			_ = c.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(CloseCLIOutdated, ""))
@@ -57,6 +62,22 @@ func newFakeBackend(t *testing.T, mode string) *fakeBackend {
 			// Never read again: gorilla only answers pings while reading, so
 			// the client's pings go unanswered -- a half-open connection.
 			<-r.Context().Done()
+		case "supersede":
+			time.Sleep(50 * time.Millisecond)
+			_ = c.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(CloseSuperseded, ""))
+			<-r.Context().Done()
+		case "record_close":
+			for {
+				if _, _, err := c.ReadMessage(); err != nil {
+					var ce *websocket.CloseError
+					if errors.As(err, &ce) {
+						fb.mu.Lock()
+						fb.closeCode = ce.Code
+						fb.mu.Unlock()
+					}
+					return
+				}
+			}
 		case "restart":
 			time.Sleep(50 * time.Millisecond)
 			_ = c.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseServiceRestart, ""))
@@ -160,4 +181,40 @@ func TestRegisterRejectedOutdatedIsFatal(t *testing.T) {
 	if !IsFatal(err) {
 		t.Fatalf("want fatal error, got %v", err)
 	}
+}
+
+func TestSupersededIsTypedAndNotFatal(t *testing.T) {
+	fb := newFakeBackend(t, "supersede")
+	sess := dialFake(t, fb)
+	err := sess.Run(context.Background(), nopHandler{})
+	if !errors.Is(err, ErrSuperseded) || IsFatal(err) {
+		t.Fatalf("want non-fatal ErrSuperseded, got %v", err)
+	}
+}
+
+func TestUnknownRegisterRejectionRetries(t *testing.T) {
+	fb := newFakeBackend(t, "reject_unknown")
+	_, err := Dial(context.Background(), fb.srv.URL, "tok", "0.3.0", sysinfo.Info{})
+	if err == nil || IsFatal(err) {
+		t.Fatalf("unknown rejection must be retryable, got %v", err)
+	}
+}
+
+func TestRunSendsGracefulCloseOnExit(t *testing.T) {
+	fb := newFakeBackend(t, "record_close")
+	sess := dialFake(t, fb)
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() { time.Sleep(50 * time.Millisecond); cancel() }()
+	_ = sess.Run(ctx, nopHandler{})
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		fb.mu.Lock()
+		code := fb.closeCode
+		fb.mu.Unlock()
+		if code == websocket.CloseNormalClosure {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("backend never received a normal close frame")
 }

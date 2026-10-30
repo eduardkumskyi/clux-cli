@@ -2,6 +2,7 @@ package dialproxy
 
 import (
 	"context"
+	"encoding/base64"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -82,4 +83,57 @@ func TestCloseAll(t *testing.T) {
 	if r.Len() != 0 {
 		t.Fatalf("registry not empty: %d", r.Len())
 	}
+}
+
+// stuckSidecar accepts a WS but never reads, so writes back up.
+func stuckSidecar(t *testing.T) int {
+	t.Helper()
+	up := websocket.Upgrader{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		c, err := up.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		<-r.Context().Done()
+		c.Close()
+	}))
+	t.Cleanup(srv.Close)
+	_, p, _ := net.SplitHostPort(srv.Listener.Addr().String())
+	port, _ := strconv.Atoi(p)
+	return port
+}
+
+func TestDataNeverBlocksTunnelReaderWhenStreamIsStuck(t *testing.T) {
+	port := stuckSidecar(t)
+	r := NewRegistry()
+	var f frames
+	r.Open(context.Background(), "slow", port, "", f.send)
+	big := base64Payload(1 << 20) // 1 MiB messages fill socket buffers fast
+	done := make(chan struct{})
+	go func() {
+		for i := 0; i < 500; i++ {
+			r.Data("slow", big)
+		}
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Data blocked the caller (the tunnel reader)")
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	sawClose := false
+	for _, fr := range f.got {
+		if fr["type"] == "dial.close" && fr["stream_id"] == "slow" {
+			sawClose = true
+		}
+	}
+	if !sawClose {
+		t.Fatal("overflowing stream was not closed with dial.close")
+	}
+}
+
+func base64Payload(n int) string {
+	return base64.StdEncoding.EncodeToString(make([]byte, n))
 }

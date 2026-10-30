@@ -41,7 +41,7 @@ func TestResultQueuedJustBeforeDropIsResent(t *testing.T) {
 	r.Attach(old)
 	r.Deliver(map[string]any{"correlation_id": "c2"})
 	old.alive = false
-	now = now.Add(3 * time.Second) // session died 3s later: frame may not have left
+	now = now.Add(50 * time.Second) // half-open session detected 50s later: frame may never have left
 	r.Detach(old)
 	next := &fakeSender{alive: true}
 	if n := r.Attach(next); n != 1 {
@@ -56,7 +56,7 @@ func TestOldDeliveredResultsAreNotResent(t *testing.T) {
 	old := &fakeSender{alive: true}
 	r.Attach(old)
 	r.Deliver(map[string]any{"correlation_id": "c3"})
-	now = now.Add(time.Minute) // long since written
+	now = now.Add(3 * time.Minute) // long since written (beyond Window)
 	r.Detach(old)
 	if n := r.Attach(&fakeSender{alive: true}); n != 0 {
 		t.Fatalf("re-sent %d stale results", n)

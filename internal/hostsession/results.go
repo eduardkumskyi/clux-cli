@@ -48,7 +48,11 @@ type sentResult struct {
 
 // NewResults returns a courier with sane defaults.
 func NewResults() *Results {
-	return &Results{Window: 15 * time.Second, TTL: 10 * time.Minute, Max: 64, now: time.Now}
+	// Window must exceed how long a dead connection can go unnoticed
+	// (tunnel ReadTimeout 45s + WriteTimeout 10s): a result queued into a
+	// half-open session during that time never reached the backend.
+	// Duplicates are harmless, so err well on the long side.
+	return &Results{Window: 2 * time.Minute, TTL: 10 * time.Minute, Max: 64, now: time.Now}
 }
 
 // Deliver sends a result now if possible, else keeps it for the next session.

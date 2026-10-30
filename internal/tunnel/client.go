@@ -81,6 +81,10 @@ func IsFatal(err error) bool {
 	return errors.As(err, &f)
 }
 
+// ErrSuperseded means another process (same token, maybe another machine)
+// registered this host and the backend dropped us in its favor.
+var ErrSuperseded = errors.New("another process or machine is using this host's token; it replaced this connection")
+
 // ErrReconnectRequested is returned by Run when the caller asked for a
 // proactive reconnect (sleep/wake or network change detected).
 var ErrReconnectRequested = errors.New("reconnect requested")
@@ -184,10 +188,14 @@ func Dial(ctx context.Context, backendURL, token, cliVersion string, info sysinf
 	case "register_ack":
 	case "register_rejected":
 		conn.Close()
-		if ack.Reason == "cli_outdated" {
+		switch ack.Reason {
+		case "cli_outdated":
 			return nil, &ErrFatal{fmt.Errorf("registration rejected: clux %s is too old (backend needs >= %s); update: curl -fsSL https://clux.space/install.sh | sh", cliVersion, ack.MinVersion)}
+		case "invalid_token", "revoked":
+			return nil, &ErrFatal{fmt.Errorf("registration rejected: %s (run `clux login --token ...` with a new token)", ack.Reason)}
 		}
-		return nil, &ErrFatal{fmt.Errorf("registration rejected: %s", ack.Reason)}
+		// Unknown reason: may be transient (backend-side), retry with backoff.
+		return nil, fmt.Errorf("registration rejected: %s", ack.Reason)
 	default:
 		conn.Close()
 		return nil, fmt.Errorf("unexpected response from backend: %q", ack.Type)
@@ -331,8 +339,10 @@ func (s *Session) Kick(reason error) {
 // local IP) is detected within d instead of the full ReadTimeout. A pong or
 // any frame restores the normal deadline.
 func (s *Session) Probe(d time.Duration) {
-	_ = s.conn.WriteControl(websocket.PingMessage, nil, time.Now().Add(s.writeTimeout()))
+	// Deadline first: a pong racing back before it is set would otherwise be
+	// overwritten by the shorter deadline and cause a false "dead" verdict.
 	_ = s.conn.SetReadDeadline(time.Now().Add(d))
+	_ = s.conn.WriteControl(websocket.PingMessage, nil, time.Now().Add(s.writeTimeout()))
 }
 
 // Run enters the long-running full-duplex loop: one reader goroutine reads
@@ -358,6 +368,10 @@ func (s *Session) Run(ctx context.Context, h Handler) error {
 		s.mu.Unlock()
 		cancel()
 		close(s.done)
+		// Graceful close frame (best effort; the peer may be long gone) so a
+		// live backend marks us offline at once instead of via its watchdog.
+		_ = s.conn.WriteControl(websocket.CloseMessage,
+			websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""), time.Now().Add(time.Second))
 		_ = s.conn.Close()
 		wg.Wait()
 	}()
@@ -509,7 +523,7 @@ func (s *Session) readLoop(ctx context.Context, h Handler) error {
 				case CloseInvalidToken:
 					return &ErrFatal{fmt.Errorf("backend revoked this host's token")}
 				case CloseSuperseded:
-					return fmt.Errorf("replaced by a newer connection of this host (is `clux host start` running twice?)")
+					return ErrSuperseded
 				case CloseStale:
 					return fmt.Errorf("backend closed the tunnel as stale")
 				case websocket.CloseServiceRestart:

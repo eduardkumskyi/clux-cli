@@ -7,11 +7,13 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"os"
 	"os/signal"
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -25,10 +27,26 @@ import (
 	"github.com/eduardkumskyi/clux-cli/internal/tunnel"
 )
 
+// Exit codes for `clux host start`, so a supervisor (a future launchd /
+// systemd unit) can tell "restart me" from "restarting won't help".
+const (
+	exitFatalConfig    = 3 // token revoked/invalid, CLI too old: needs the user
+	exitAlreadyRunning = 4
+)
+
 // probeAfterNetworkChange bounds how long a tunnel that survived a network
 // change (its local IP still exists) may stay silent before it is declared
 // dead.
 const probeAfterNetworkChange = 5 * time.Second
+
+// exitError carries a specific process exit code up to main.
+type exitError struct {
+	code int
+	err  error
+}
+
+func (e *exitError) Error() string { return e.err.Error() }
+func (e *exitError) Unwrap() error { return e.err }
 
 // logWriter routes the stdlib logger (used by hostsession) through logx so
 // every line shares one timestamp format.
@@ -51,8 +69,14 @@ func runHostStart(args []string) error {
 		return err
 	}
 
-	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer cancel()
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	// After the first Ctrl-C starts a graceful shutdown, restore the default
+	// signal behavior so a second Ctrl-C kills the process immediately.
+	go func() {
+		<-ctx.Done()
+		stop()
+	}()
 
 	stateDir, err := config.Dir()
 	if err != nil {
@@ -60,12 +84,15 @@ func runHostStart(args []string) error {
 	}
 	lock, err := hostlock.Acquire(stateDir)
 	if err != nil {
+		if hostlock.IsHeld(err) {
+			return &exitError{code: exitAlreadyRunning, err: err}
+		}
 		return err
 	}
 	defer lock.Release()
 
 	// Log to stderr and to a rotating file, so an outage can be diagnosed
-	// after the fact (`~/.clux/logs/host.log`, 5 MB x 4 files).
+	// after the fact (`~/.clux/logs/host.log`, 5 MB, 3 old files kept).
 	var out io.Writer = os.Stderr
 	logPath := filepath.Join(stateDir, "logs", "host.log")
 	if lf, ferr := logx.OpenRotating(logPath, 5<<20, 3); ferr == nil {
@@ -80,21 +107,44 @@ func runHostStart(args []string) error {
 	defer logger.Flush()
 	logger.Printf("clux %s starting (log: %s)", version, logPath)
 
-	events := netwatch.Watch(ctx, netwatch.Options{})
-	h := &hostLoop{cfg: cfg, interval: *interval, log: logger, events: events, results: hostsession.NewResults()}
-	return h.run(ctx)
+	h := newHostLoop(cfg, *interval, logger)
+	go h.dispatch(ctx, netwatch.Watch(ctx, netwatch.Options{}))
+	err = h.run(ctx)
+	if err != nil && tunnel.IsFatal(err) {
+		// Into host.log too, before exiting: after-the-fact diagnosis is the
+		// whole point of the file.
+		logger.Printf("fatal: %v", err)
+		return &exitError{code: exitFatalConfig, err: err}
+	}
+	return err
 }
 
 type hostLoop struct {
 	cfg      *config.Config
 	interval time.Duration
 	log      *logx.Logger
-	events   <-chan netwatch.Event
 	results  *hostsession.Results
+
+	// Network/sleep events are consumed by ONE goroutine (dispatch). It
+	// routes them to the live session (cur) if there is one, else raises
+	// wake so a pending reconnect wait ends early.
+	mu   sync.Mutex
+	cur  *tunnel.Session
+	wake chan struct{}
 
 	bo        backoff.Policy
 	downSince time.Time // zero while connected
 	attempts  int
+}
+
+func newHostLoop(cfg *config.Config, interval time.Duration, l *logx.Logger) *hostLoop {
+	return &hostLoop{
+		cfg:      cfg,
+		interval: interval,
+		log:      l,
+		results:  hostsession.NewResults(),
+		wake:     make(chan struct{}, 1),
+	}
 }
 
 func (h *hostLoop) run(ctx context.Context) error {
@@ -113,7 +163,18 @@ func (h *hostLoop) run(ctx context.Context) error {
 		}
 		h.attempts++
 		delay := h.bo.SessionEnded(lived, immediate)
-		h.log.Repeatable("tunnel down: %s", summarize(err))
+		if errors.Is(err, tunnel.ErrSuperseded) {
+			// Two agents on one token keep replacing each other; reconnecting
+			// fast would just continue the fight. Say so loudly, back off long.
+			h.log.Printf("WARNING: %v. Stop the other `clux host start` (another terminal or machine), "+
+				"or create a separate host for it. Retrying in %s.", err, h.bo.Max)
+			delay = h.bo.Max
+			if delay <= 0 {
+				delay = 30 * time.Second
+			}
+		} else {
+			h.log.Repeatable("tunnel down: %s", summarize(err))
+		}
 		if !h.wait(ctx, delay) {
 			h.log.Printf("stopped (containers keep running; `clux host start` reattaches them)")
 			return nil
@@ -130,21 +191,88 @@ func (h *hostLoop) wait(ctx context.Context, d time.Duration) bool {
 	}
 	t := time.NewTimer(d)
 	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-t.C:
+		return true
+	case <-h.wake:
+		h.bo.Reset()
+		return true
+	}
+}
+
+// dispatch is the single consumer of netwatch events.
+func (h *hostLoop) dispatch(ctx context.Context, events <-chan netwatch.Event) {
 	for {
 		select {
 		case <-ctx.Done():
-			return false
-		case <-t.C:
-			return true
-		case ev, ok := <-h.events:
+			return
+		case ev, ok := <-events:
 			if !ok {
-				h.events = nil
+				return
+			}
+			h.mu.Lock()
+			sess := h.cur
+			h.mu.Unlock()
+			if sess == nil {
+				select {
+				case h.wake <- struct{}{}:
+				default:
+				}
 				continue
 			}
-			if ev.Kind == netwatch.NetworkChanged || ev.Kind == netwatch.Woke {
-				h.bo.Reset()
-				return true
-			}
+			h.applyToSession(sess, ev)
+		}
+	}
+}
+
+// applyToSession turns a sleep/wake or network-change event into either an
+// immediate reconnect (the tunnel is certainly dead) or a fast liveness
+// probe (it may have survived).
+func (h *hostLoop) applyToSession(sess *tunnel.Session, ev netwatch.Event) {
+	switch ev.Kind {
+	case netwatch.Woke:
+		sess.Kick(fmt.Errorf("machine woke up or was suspended (%s unaccounted)", ev.Gap.Round(time.Second)))
+	case netwatch.NetworkChanged:
+		local := sess.LocalAddr()
+		if isLoopback(local) {
+			// Tunnel goes through a local proxy: our own address says
+			// nothing about the path, so just verify liveness.
+			sess.Probe(probeAfterNetworkChange)
+			return
+		}
+		if !netwatch.HasIP(ev.Addrs, local) {
+			sess.Kick(fmt.Errorf("network changed (local address %s is gone)", local))
+			return
+		}
+		h.log.Printf("network changed; checking the tunnel")
+		sess.Probe(probeAfterNetworkChange)
+	}
+}
+
+func isLoopback(a net.Addr) bool {
+	if a == nil {
+		return false
+	}
+	host := a.String()
+	if hh, _, err := net.SplitHostPort(host); err == nil {
+		host = hh
+	}
+	ip := net.ParseIP(strings.Trim(host, "[]"))
+	return ip != nil && ip.IsLoopback()
+}
+
+func (h *hostLoop) setCurrent(s *tunnel.Session) {
+	h.mu.Lock()
+	h.cur = s
+	h.mu.Unlock()
+	if s != nil {
+		// Events seen while dialing were about the old path; this fresh
+		// connection was made after them.
+		select {
+		case <-h.wake:
+		default:
 		}
 	}
 }
@@ -193,46 +321,18 @@ func (h *hostLoop) session(ctx context.Context) (lived time.Duration, immediate 
 		}
 	}()
 
-	go h.watchSession(sessionCtx, sess)
-
 	if n := h.results.Attach(sess); n > 0 {
 		h.log.Printf("re-sent %d command result(s) from the previous connection", n)
 	}
 	handler := hostsession.New(ctx, sess, h.results)
+	h.setCurrent(sess)
 	runErr := sess.Run(sessionCtx, handler)
+	h.setCurrent(nil)
 	h.results.Detach(sess)
 	handler.Close()
-	_ = sess.Close()
 
 	lived = time.Since(registeredAt)
 	return lived, errors.Is(runErr, tunnel.ErrReconnectRequested), runErr
-}
-
-// watchSession turns sleep/wake and network-change events into either an
-// immediate reconnect (the tunnel is certainly dead) or a fast liveness
-// probe (it may have survived).
-func (h *hostLoop) watchSession(ctx context.Context, sess *tunnel.Session) {
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case ev, ok := <-h.events:
-			if !ok {
-				return
-			}
-			switch ev.Kind {
-			case netwatch.Woke:
-				sess.Kick(fmt.Errorf("machine woke up or was suspended (%s unaccounted)", ev.Gap.Round(time.Second)))
-			case netwatch.NetworkChanged:
-				if !netwatch.HasIP(ev.Addrs, sess.LocalAddr()) {
-					sess.Kick(fmt.Errorf("network changed (local address %s is gone)", sess.LocalAddr()))
-				} else {
-					h.log.Printf("network changed; checking the tunnel")
-					sess.Probe(probeAfterNetworkChange)
-				}
-			}
-		}
-	}
 }
 
 var ephemeralPort = regexp.MustCompile(`((?:\d{1,3}\.){3}\d{1,3}|\[[0-9a-fA-F:]+\]):\d+->`)
