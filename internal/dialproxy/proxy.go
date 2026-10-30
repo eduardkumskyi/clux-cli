@@ -117,16 +117,16 @@ func (r *Registry) Data(streamID, dataB64 string) {
 		// the tunnel's single reader (that would stall every other stream,
 		// heartbeat acks and commands): drop this stream instead and tell
 		// the backend, which reopens it.
-		r.Close(streamID)
-		if st.send != nil {
+		if r.Close(streamID) && st.send != nil {
 			st.send(map[string]any{"type": "dial.close", "stream_id": streamID})
 		}
 	}
 }
 
 // Close routes a dial.close frame (backend tore down its side) to the
-// stream, tearing down the local connection. Idempotent.
-func (r *Registry) Close(streamID string) {
+// stream, tearing down the local connection. Idempotent; reports whether
+// this call removed the stream (so callers echo dial.close at most once).
+func (r *Registry) Close(streamID string) bool {
 	r.mu.Lock()
 	st, ok := r.streams[streamID]
 	if ok {
@@ -134,13 +134,16 @@ func (r *Registry) Close(streamID string) {
 	}
 	r.mu.Unlock()
 	if !ok {
-		return
+		return false
 	}
 	select {
 	case st.closeCh <- struct{}{}:
 	default:
 	}
-	closeGracefully(st.conn)
+	// Runs on the tunnel's reader goroutine (dial.close / overflow), and a
+	// graceful close can block up to its 1s write deadline: do it async.
+	go closeGracefully(st.conn)
+	return true
 }
 
 // CloseAll tears down every open stream (session ended). Idempotent.

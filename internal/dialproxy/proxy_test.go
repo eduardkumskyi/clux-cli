@@ -137,3 +137,39 @@ func TestDataNeverBlocksTunnelReaderWhenStreamIsStuck(t *testing.T) {
 func base64Payload(n int) string {
 	return base64.StdEncoding.EncodeToString(make([]byte, n))
 }
+
+func TestCloseReportsRemovalOnce(t *testing.T) {
+	port, _ := sidecarStub(t)
+	r := NewRegistry()
+	var f frames
+	r.Open(context.Background(), "x", port, "", f.send)
+	if !r.Close("x") {
+		t.Fatal("first Close should remove the stream")
+	}
+	if r.Close("x") {
+		t.Fatal("second Close must report false")
+	}
+}
+
+func TestOverflowSendsSingleDialClose(t *testing.T) {
+	port := stuckSidecar(t)
+	r := NewRegistry()
+	var f frames
+	r.Open(context.Background(), "dup", port, "", f.send)
+	big := base64Payload(1 << 20)
+	for i := 0; i < 500; i++ {
+		r.Data("dup", big)
+	}
+	time.Sleep(200 * time.Millisecond) // let the pump notice its closed socket
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	n := 0
+	for _, fr := range f.got {
+		if fr["type"] == "dial.close" {
+			n++
+		}
+	}
+	if n != 1 {
+		t.Fatalf("want exactly one dial.close, got %d", n)
+	}
+}

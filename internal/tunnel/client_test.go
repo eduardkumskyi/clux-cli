@@ -218,3 +218,18 @@ func TestRunSendsGracefulCloseOnExit(t *testing.T) {
 	}
 	t.Fatal("backend never received a normal close frame")
 }
+
+func TestProbeTimeoutReportsProbeWindow(t *testing.T) {
+	fb := newFakeBackend(t, "silent")
+	sess := dialFake(t, fb)
+	sess.ReadTimeout = 10 * time.Second // only the probe can end this run quickly
+	sess.PingInterval = time.Hour
+	go func() {
+		time.Sleep(30 * time.Millisecond)
+		sess.Probe(100 * time.Millisecond)
+	}()
+	err := sess.Run(context.Background(), nopHandler{})
+	if err == nil || !strings.Contains(err.Error(), "probe within 100ms") {
+		t.Fatalf("want probe timeout error, got %v", err)
+	}
+}

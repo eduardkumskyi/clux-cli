@@ -30,6 +30,7 @@ import (
 	"net/http"
 	"net/url"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -112,6 +113,10 @@ type Session struct {
 
 	mu     sync.Mutex
 	kickCh chan error
+
+	// probing holds the active Probe deadline (ns) until a frame arrives,
+	// so a probe timeout is reported with the probe's own window.
+	probing atomic.Int64
 }
 
 type registerAck struct {
@@ -315,6 +320,7 @@ func (s *Session) writeTimeout() time.Duration {
 // extendRead pushes the read deadline forward; called on every inbound
 // frame, ping and pong.
 func (s *Session) extendRead() {
+	s.probing.Store(0)
 	_ = s.conn.SetReadDeadline(time.Now().Add(s.readTimeout()))
 }
 
@@ -341,6 +347,7 @@ func (s *Session) Kick(reason error) {
 func (s *Session) Probe(d time.Duration) {
 	// Deadline first: a pong racing back before it is set would otherwise be
 	// overwritten by the shorter deadline and cause a false "dead" verdict.
+	s.probing.Store(int64(d))
 	_ = s.conn.SetReadDeadline(time.Now().Add(d))
 	_ = s.conn.WriteControl(websocket.PingMessage, nil, time.Now().Add(s.writeTimeout()))
 }
@@ -515,6 +522,9 @@ func (s *Session) readLoop(ctx context.Context, h Handler) error {
 			}
 			var ne net.Error
 			if errors.As(err, &ne) && ne.Timeout() {
+				if p := time.Duration(s.probing.Load()); p > 0 {
+					return fmt.Errorf("no answer to a liveness probe within %s after a network change", p)
+				}
 				return fmt.Errorf("connection silent for %s (no frames or pongs)", s.readTimeout())
 			}
 			var ce *websocket.CloseError
