@@ -130,6 +130,26 @@ func (r *Registry) Close(streamID string) {
 	closeGracefully(st.conn)
 }
 
+// CloseAll tears down every open stream (session ended). Idempotent.
+func (r *Registry) CloseAll() {
+	r.mu.Lock()
+	ids := make([]string, 0, len(r.streams))
+	for id := range r.streams {
+		ids = append(ids, id)
+	}
+	r.mu.Unlock()
+	for _, id := range ids {
+		r.Close(id)
+	}
+}
+
+// Len is the number of open streams.
+func (r *Registry) Len() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return len(r.streams)
+}
+
 // closeGracefully sends a WS close frame before dropping the TCP
 // connection. Skipping it still works, but it spams the sidecar's own
 // logs with "connection closed without proper close handshake" warnings
@@ -158,6 +178,13 @@ func (r *Registry) pump(ctx context.Context, streamID string, st *stream, send f
 			case <-st.closeCh:
 				return
 			case <-ctx.Done():
+				// The tunnel session ended (disconnect / reconnect). Close
+				// the local socket too: otherwise the read loop below keeps
+				// it open and the sidecar believes the backend is still
+				// attached (it would keep streaming a chat turn into a
+				// connection nobody reads, instead of parking the output
+				// for the backend's reconnect to replay).
+				closeGracefully(st.conn)
 				return
 			}
 		}

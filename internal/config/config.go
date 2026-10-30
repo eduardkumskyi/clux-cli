@@ -93,3 +93,6 @@ func Remove() error {
 	}
 	return nil
 }
+
+// Dir is the CLI's state directory (~/.clux): config, lock file, logs.
+func Dir() (string, error) { return dir() }

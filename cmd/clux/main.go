@@ -15,19 +15,16 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
-	"os/signal"
 	"strings"
-	"syscall"
 	"time"
 
 	"github.com/eduardkumskyi/clux-cli/internal/config"
-	"github.com/eduardkumskyi/clux-cli/internal/hostsession"
 	"github.com/eduardkumskyi/clux-cli/internal/sysinfo"
 	"github.com/eduardkumskyi/clux-cli/internal/tunnel"
 )
 
 // version is overridden at release time via -ldflags "-X main.version=...".
-var version = "0.2.0"
+var version = "0.3.0"
 
 const (
 	// The backend (Django/Channels) is served at api.clux.space via the
@@ -35,7 +32,6 @@ const (
 	// /ws/ path with index.html (-> "bad handshake").
 	defaultBackendURL = "https://api.clux.space"
 	defaultHeartbeat  = 30 * time.Second
-	reconnectBackoff  = 5 * time.Second
 )
 
 func main() {
@@ -209,78 +205,4 @@ func checkDockerResourceLimits() error {
 	}
 
 	return fmt.Errorf("docker run with --cpus/--memory failed -- either the busybox test image couldn't be pulled, or this docker daemon doesn't support CPU/memory resource limits (both would break every workspace start): %s", strings.TrimSpace(msg))
-}
-
-func runHostStart(args []string) error {
-	fs := flag.NewFlagSet("host start", flag.ExitOnError)
-	interval := fs.Duration("interval", defaultHeartbeat, "heartbeat interval")
-	if err := fs.Parse(args); err != nil {
-		return err
-	}
-
-	cfg, err := config.Load()
-	if err != nil {
-		return err
-	}
-
-	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer cancel()
-
-	for {
-		if err := runSession(ctx, cfg, *interval); err != nil {
-			if ctx.Err() != nil {
-				return nil
-			}
-			fmt.Fprintln(os.Stderr, "clux: session error, reconnecting:", err)
-			select {
-			case <-time.After(reconnectBackoff):
-			case <-ctx.Done():
-				return nil
-			}
-		}
-	}
-}
-
-// runSession holds one tunnel connection open for the duration of its
-// lifetime: register, then enter the full-duplex loop (tunnel.Session.Run)
-// where a background goroutine ticks heartbeats into the same outbox that
-// lifecycle command results and dial frames flow through, while the
-// connection's reader dispatches whatever the backend pushes
-// (workspace.start/stop/delete, dial.open/data/close) to hostsession.Handler.
-func runSession(ctx context.Context, cfg *config.Config, interval time.Duration) error {
-	info, err := sysinfo.Collect(config.DefaultStorageRoot())
-	if err != nil {
-		return fmt.Errorf("collecting system info: %w", err)
-	}
-
-	sess, err := tunnel.Dial(ctx, cfg.BackendURL, cfg.Token, version, info)
-	if err != nil {
-		return err
-	}
-	defer sess.Close()
-	fmt.Printf("registered as host %q (id=%d)\n", sess.Name, sess.HostID)
-
-	sessionCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
-
-	go func() {
-		ticker := time.NewTicker(interval)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-sessionCtx.Done():
-				return
-			case <-ticker.C:
-				info, err := sysinfo.Collect(config.DefaultStorageRoot())
-				if err != nil {
-					fmt.Fprintln(os.Stderr, "clux: collecting system info for heartbeat:", err)
-					continue
-				}
-				sess.SendHeartbeat(info, version)
-			}
-		}
-	}()
-
-	handler := hostsession.New(sess)
-	return sess.Run(sessionCtx, handler)
 }
