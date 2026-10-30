@@ -37,6 +37,10 @@ import (
 // take before it's reported back as a dial.error.
 const dialTimeout = 5 * time.Second
 
+// localWriteTimeout bounds one write to the local sidecar socket; a peer
+// that stops reading must not wedge its stream's writer forever.
+const localWriteTimeout = 10 * time.Second
+
 // Registry tracks open streams by stream_id so inbound dial.data/dial.close
 // frames (routed by the tunnel's reader loop) can reach the right stream's
 // pump. Safe for concurrent use.
@@ -56,6 +60,7 @@ type stream struct {
 	// isn't mistaken for a close.
 	inbound chan []byte
 	closeCh chan struct{}
+	send    func(frame any)
 }
 
 // Open handles one dial.open frame: dials the sidecar's WebSocket port
@@ -78,7 +83,7 @@ func (r *Registry) Open(ctx context.Context, streamID string, port int, secret s
 		return
 	}
 
-	st := &stream{conn: conn, inbound: make(chan []byte, 64), closeCh: make(chan struct{}, 1)}
+	st := &stream{conn: conn, inbound: make(chan []byte, 64), closeCh: make(chan struct{}, 1), send: send}
 	r.mu.Lock()
 	r.streams[streamID] = st
 	r.mu.Unlock()
@@ -107,13 +112,21 @@ func (r *Registry) Data(streamID, dataB64 string) {
 	}
 	select {
 	case st.inbound <- raw:
-	case <-st.closeCh:
+	default:
+		// The local peer isn't keeping up and the queue is full. Never block
+		// the tunnel's single reader (that would stall every other stream,
+		// heartbeat acks and commands): drop this stream instead and tell
+		// the backend, which reopens it.
+		if r.Close(streamID) && st.send != nil {
+			st.send(map[string]any{"type": "dial.close", "stream_id": streamID})
+		}
 	}
 }
 
 // Close routes a dial.close frame (backend tore down its side) to the
-// stream, tearing down the local connection. Idempotent.
-func (r *Registry) Close(streamID string) {
+// stream, tearing down the local connection. Idempotent; reports whether
+// this call removed the stream (so callers echo dial.close at most once).
+func (r *Registry) Close(streamID string) bool {
 	r.mu.Lock()
 	st, ok := r.streams[streamID]
 	if ok {
@@ -121,13 +134,36 @@ func (r *Registry) Close(streamID string) {
 	}
 	r.mu.Unlock()
 	if !ok {
-		return
+		return false
 	}
 	select {
 	case st.closeCh <- struct{}{}:
 	default:
 	}
-	closeGracefully(st.conn)
+	// Runs on the tunnel's reader goroutine (dial.close / overflow), and a
+	// graceful close can block up to its 1s write deadline: do it async.
+	go closeGracefully(st.conn)
+	return true
+}
+
+// CloseAll tears down every open stream (session ended). Idempotent.
+func (r *Registry) CloseAll() {
+	r.mu.Lock()
+	ids := make([]string, 0, len(r.streams))
+	for id := range r.streams {
+		ids = append(ids, id)
+	}
+	r.mu.Unlock()
+	for _, id := range ids {
+		r.Close(id)
+	}
+}
+
+// Len is the number of open streams.
+func (r *Registry) Len() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return len(r.streams)
 }
 
 // closeGracefully sends a WS close frame before dropping the TCP
@@ -152,12 +188,20 @@ func (r *Registry) pump(ctx context.Context, streamID string, st *stream, send f
 		for {
 			select {
 			case raw := <-st.inbound:
+				_ = st.conn.SetWriteDeadline(time.Now().Add(localWriteTimeout))
 				if err := st.conn.WriteMessage(websocket.TextMessage, raw); err != nil {
 					return
 				}
 			case <-st.closeCh:
 				return
 			case <-ctx.Done():
+				// The tunnel session ended (disconnect / reconnect). Close
+				// the local socket too: otherwise the read loop below keeps
+				// it open and the sidecar believes the backend is still
+				// attached (it would keep streaming a chat turn into a
+				// connection nobody reads, instead of parking the output
+				// for the backend's reconnect to replay).
+				closeGracefully(st.conn)
 				return
 			}
 		}

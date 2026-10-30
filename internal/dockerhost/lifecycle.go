@@ -23,8 +23,42 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
+
+// containerLocks serializes Start/Stop/Delete per container name. Lifecycle
+// commands outlive the tunnel session that issued them (they run under the
+// process context), so after a reconnect the backend can re-issue a
+// workspace.start for a container whose previous start is still running.
+// Without this, the second start's stopAndRemove would kill the first run's
+// container and the first run's failure cleanup would then remove the
+// second run's container.
+var (
+	containerLocksMu sync.Mutex
+	containerLocks   = map[string]chan struct{}{}
+)
+
+// lockContainer takes the per-name lock (ctx-aware); call the returned
+// unlock exactly once.
+func lockContainer(ctx context.Context, name string) (func(), error) {
+	if name == "" {
+		return func() {}, nil
+	}
+	containerLocksMu.Lock()
+	ch, ok := containerLocks[name]
+	if !ok {
+		ch = make(chan struct{}, 1)
+		containerLocks[name] = ch
+	}
+	containerLocksMu.Unlock()
+	select {
+	case ch <- struct{}{}:
+		return func() { <-ch }, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
 
 // sandboxNetwork is the dedicated bridge network every BYOC workspace
 // container is attached to. See the package doc comment for exactly what
@@ -86,6 +120,12 @@ func EnsureNetwork(ctx context.Context) error {
 // SidecarContainerPort. On any failure it best-effort removes the
 // container it just tried to create before returning the error.
 func Start(ctx context.Context, req StartRequest) (StartResult, error) {
+	unlock, err := lockContainer(ctx, req.ContainerName)
+	if err != nil {
+		return StartResult{}, err
+	}
+	defer unlock()
+
 	if err := EnsureNetwork(ctx); err != nil {
 		return StartResult{}, err
 	}
@@ -116,19 +156,23 @@ func Start(ctx context.Context, req StartRequest) (StartResult, error) {
 	}
 	args = append(args, req.Image)
 
-	if _, err := runDocker(ctx, args...); err != nil {
-		cleanupFailedStart(req.ContainerName)
+	out, err := runDocker(ctx, args...)
+	// `docker run -d` prints the new container's ID; cleanup targets that
+	// exact container, never just the name (see containerLocks).
+	containerID := strings.TrimSpace(out)
+	if err != nil {
+		cleanupFailedStart(containerID, req.ContainerName)
 		return StartResult{}, fmt.Errorf("docker run failed: %w", err)
 	}
 
 	if err := waitRunning(ctx, req.ContainerName); err != nil {
-		cleanupFailedStart(req.ContainerName)
+		cleanupFailedStart(containerID, req.ContainerName)
 		return StartResult{}, err
 	}
 
 	port, err := publishedPort(ctx, req.ContainerName, req.SidecarContainerPort)
 	if err != nil {
-		cleanupFailedStart(req.ContainerName)
+		cleanupFailedStart(containerID, req.ContainerName)
 		return StartResult{}, err
 	}
 
@@ -140,6 +184,11 @@ func Start(ctx context.Context, req StartRequest) (StartResult, error) {
 // by contract (ByocWorkspaceProvider.stop/replace may be called on a
 // workspace whose container is already gone).
 func Stop(ctx context.Context, containerName string) error {
+	unlock, err := lockContainer(ctx, containerName)
+	if err != nil {
+		return err
+	}
+	defer unlock()
 	return stopAndRemove(ctx, containerName)
 }
 
@@ -155,6 +204,11 @@ type DeleteResult struct {
 // decrement storage_gb_reserved; a measurement failure is not fatal to the
 // delete itself, it just reports 0 freed.
 func Delete(ctx context.Context, containerName, volumeName string) (DeleteResult, error) {
+	unlock, err := lockContainer(ctx, containerName)
+	if err != nil {
+		return DeleteResult{}, err
+	}
+	defer unlock()
 	if err := stopAndRemove(ctx, containerName); err != nil {
 		return DeleteResult{}, err
 	}
@@ -185,10 +239,33 @@ func stopAndRemove(ctx context.Context, containerName string) error {
 	return nil
 }
 
-func cleanupFailedStart(containerName string) {
-	// Best-effort: ignore errors, this is already an error path and the
-	// container may not even exist yet (e.g. docker run itself failed).
-	_, _ = runDocker(context.Background(), "rm", "-f", containerName)
+// cleanupFailedStart removes the container this Start created. By ID when
+// docker printed one; by name only when it didn't (docker run failed before
+// creating anything, or after creating it without printing) -- safe because
+// the caller holds this name's lock, so no other Start/Stop/Delete can own a
+// container of that name right now.
+func cleanupFailedStart(containerID, containerName string) {
+	target := containerID
+	if !looksLikeContainerID(target) {
+		target = containerName
+	}
+	if target == "" {
+		return
+	}
+	// Best-effort: ignore errors, this is already an error path.
+	_, _ = runDocker(context.Background(), "rm", "-f", target)
+}
+
+func looksLikeContainerID(s string) bool {
+	if len(s) < 12 || len(s) > 64 {
+		return false
+	}
+	for _, c := range s {
+		if !(c >= '0' && c <= '9' || c >= 'a' && c <= 'f') {
+			return false
+		}
+	}
+	return true
 }
 
 func waitRunning(ctx context.Context, containerName string) error {
@@ -275,7 +352,10 @@ func formatFloat(f float64) string {
 	return strconv.FormatFloat(f, 'f', -1, 64)
 }
 
-func runDocker(ctx context.Context, args ...string) (string, error) {
+// runDocker is a variable so tests can substitute a fake docker.
+var runDocker = runDockerExec
+
+func runDockerExec(ctx context.Context, args ...string) (string, error) {
 	cmd := exec.CommandContext(ctx, "docker", args...)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout

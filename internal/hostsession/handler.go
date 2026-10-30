@@ -19,16 +19,38 @@ import (
 type Handler struct {
 	sess  *tunnel.Session
 	dials *dialproxy.Registry
+	// cmdCtx scopes docker lifecycle commands to the PROCESS, not the tunnel
+	// session: a network blip must not kill a `docker run`/`docker stop`
+	// halfway (the backend aborts its wait on reconnect, and the next start
+	// is idempotent, so letting the command finish is always the safer
+	// outcome). Ctrl+C still cancels it.
+	cmdCtx context.Context
+	// results carries command results across sessions (may be nil: then
+	// results go straight to sess).
+	results *Results
 }
 
-func New(sess *tunnel.Session) *Handler {
-	return &Handler{sess: sess, dials: dialproxy.NewRegistry()}
+// New builds a handler for one tunnel session. cmdCtx is the process-level
+// context lifecycle commands run under (see Handler.cmdCtx).
+// results (optional) is the process-wide courier that re-sends a result
+// whose session died before it went out.
+func New(cmdCtx context.Context, sess *tunnel.Session, results *Results) *Handler {
+	return &Handler{sess: sess, dials: dialproxy.NewRegistry(), cmdCtx: cmdCtx, results: results}
 }
+
+// Close tears down every local dial stream of this session. Running
+// workspace containers are NOT touched -- they keep running across
+// disconnects and are reattached by the next session's dials.
+func (h *Handler) Close() { h.dials.CloseAll() }
 
 // HandleCommand implements tunnel.Handler. It is already invoked in its
 // own goroutine by Session.Run's reader loop, so it may block on docker
-// freely.
-func (h *Handler) HandleCommand(ctx context.Context, frameType string, frame map[string]any) {
+// freely. The session ctx is deliberately ignored in favor of cmdCtx.
+func (h *Handler) HandleCommand(_ context.Context, frameType string, frame map[string]any) {
+	ctx := h.cmdCtx
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	correlationID, _ := frame["correlation_id"].(string)
 	result := map[string]any{
 		"type":           "result",
@@ -50,6 +72,10 @@ func (h *Handler) HandleCommand(ctx context.Context, frameType string, frame map
 		for k, v := range extra {
 			result[k] = v
 		}
+	}
+	if h.results != nil {
+		h.results.Deliver(result)
+		return
 	}
 	h.sess.Send(result)
 }
