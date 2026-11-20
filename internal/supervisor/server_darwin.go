@@ -31,6 +31,8 @@ const (
 	readyTimeout = 120 * time.Second
 	stopGrace    = 10 * time.Second
 	maxLogBytes  = 20 << 20
+	// simShutdownTimeout bounds `simctl shutdown all` on stop/delete.
+	simShutdownTimeout = 60 * time.Second
 )
 
 // Options configures a supervisor. Zero paths take the native.* defaults;
@@ -44,6 +46,9 @@ type Options struct {
 	// SkipUIDCheck lets tests run the server as the invoking user.
 	SkipUIDCheck bool
 	Logf         func(format string, args ...any)
+	// ShutdownSimulators shuts down every booted iOS Simulator device of
+	// the agent user (default: `xcrun simctl shutdown all`); tests fake it.
+	ShutdownSimulators func(ctx context.Context) error
 }
 
 // Server is a running supervisor.
@@ -84,6 +89,12 @@ func NewServer(opts Options) (*Server, error) {
 	}
 	if opts.Logf == nil {
 		opts.Logf = func(string, ...any) {}
+	}
+	if opts.ShutdownSimulators == nil {
+		home := opts.AgentHome
+		opts.ShutdownSimulators = func(ctx context.Context) error {
+			return shutdownSimulators(ctx, home)
+		}
 	}
 	if !opts.SkipUIDCheck && os.Getuid() != opts.Config.AgentUID {
 		return nil, fmt.Errorf("supervisor must run as %s (uid %d), not uid %d", native.AgentUser, opts.Config.AgentUID, os.Getuid())
@@ -202,8 +213,10 @@ func (s *Server) Dispatch(ctx context.Context, req Request) Response {
 		resp.SidecarPort, err = s.start(ctx, req)
 	case OpStop:
 		err = s.withLock(ctx, req.WorkspaceID, func() error { s.stopLocked(req.WorkspaceID); return nil })
+		s.releaseSimulators(ctx)
 	case OpDelete:
 		resp.FreedBytes, err = s.delete(ctx, req.WorkspaceID)
+		s.releaseSimulators(ctx)
 	case OpStatus:
 		resp = s.status()
 	default:
@@ -472,6 +485,48 @@ func belongsTo(pid int, id, wsDir string) bool {
 	v, ok := envValue(env, "WORKSPACE_ID")
 	d, _ := envValue(env, "WORKSPACE_DIR")
 	return ok && v == id && d == wsDir
+}
+
+// releaseSimulators shuts down the agent's booted simulators once no
+// workspace is running. Simulator devices are launchd services of the agent
+// user (CoreSimulatorService), not children of the sidecar, so stopping a
+// workspace's process group leaves a booted device -- and the agent-built
+// app inside it -- running. The device set is shared by all workspaces
+// (it lives in the agent's Library/), so devices are only shut down when
+// nothing else could be using them. Best effort: never fails the stop.
+func (s *Server) releaseSimulators(ctx context.Context) {
+	s.mu.Lock()
+	for _, p := range s.procs {
+		select {
+		case <-p.exited:
+		default:
+			s.mu.Unlock()
+			return
+		}
+	}
+	s.mu.Unlock()
+	ctx, cancel := context.WithTimeout(ctx, simShutdownTimeout)
+	defer cancel()
+	if err := s.opts.ShutdownSimulators(ctx); err != nil {
+		s.opts.Logf("shutting down simulators: %v", err)
+	}
+}
+
+// shutdownSimulators runs `xcrun simctl shutdown all` as the agent user.
+// No Xcode installed is not an error worth reporting.
+func shutdownSimulators(ctx context.Context, home string) error {
+	if _, err := os.Stat("/usr/bin/xcrun"); err != nil {
+		return nil
+	}
+	cmd := exec.CommandContext(ctx, "/usr/bin/xcrun", "simctl", "shutdown", "all")
+	cmd.Env = []string{"HOME=" + home, "PATH=/usr/bin:/bin:/usr/sbin:/sbin"}
+	if d := developerDir(); d != "" {
+		cmd.Env = append(cmd.Env, "DEVELOPER_DIR="+d)
+	}
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("%w: %s", err, strings.TrimSpace(string(out)))
+	}
+	return nil
 }
 
 func (s *Server) delete(ctx context.Context, id string) (int64, error) {

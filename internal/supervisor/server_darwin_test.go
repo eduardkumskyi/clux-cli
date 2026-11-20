@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -103,6 +104,8 @@ func testServer(t *testing.T, ownerUID int) (*Server, string) {
 	s, err := NewServer(Options{
 		Config: cfg, Version: "test", Socket: filepath.Join(tmp, "s.sock"),
 		AgentHome: home, RuntimeRoot: rt, SkipUIDCheck: true, Logf: t.Logf,
+		// Never touch the developer's real simulators from tests.
+		ShutdownSimulators: func(context.Context) error { return nil },
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -229,4 +232,43 @@ func TestProcArgsLive(t *testing.T) {
 	if belongsTo(cmd.Process.Pid, "9", "/nowhere") {
 		t.Fatal("wrong workspace matched")
 	}
+}
+
+func TestStopShutsDownSimulatorsOnlyWhenIdle(t *testing.T) {
+	s, rt := testServer(t, os.Getuid())
+	var shutdowns atomic.Int32
+	s.opts.ShutdownSimulators = func(context.Context) error { shutdowns.Add(1); return nil }
+	c := &Client{Socket: s.opts.Socket}
+	ctx := context.Background()
+	runtime := fakeRuntime(t, rt)
+	for _, id := range []string{"21", "22"} {
+		if _, err := c.Call(ctx, Request{
+			Op: OpStart, WorkspaceID: id, HMACSecret: "s",
+			ProxyURL: "http://ws-" + id + ":pw@127.0.0.1:47821", Runtime: runtime,
+		}); err != nil {
+			t.Fatalf("start %s: %v", id, err)
+		}
+	}
+	// Another workspace still runs: its simulators must stay up.
+	if _, err := c.Call(ctx, Request{Op: OpStop, WorkspaceID: "21"}); err != nil {
+		t.Fatal(err)
+	}
+	if n := shutdowns.Load(); n != 0 {
+		t.Fatalf("simulators shut down while workspace 22 still runs (%d)", n)
+	}
+	// Last running workspace stops: booted devices (and the agent-built
+	// apps in them) must not outlive it.
+	if _, err := c.Call(ctx, Request{Op: OpStop, WorkspaceID: "22"}); err != nil {
+		t.Fatal(err)
+	}
+	if n := shutdowns.Load(); n != 1 {
+		t.Fatalf("want 1 simulator shutdown after the last stop, got %d", n)
+	}
+	if _, err := c.Call(ctx, Request{Op: OpDelete, WorkspaceID: "21"}); err != nil {
+		t.Fatal(err)
+	}
+	if n := shutdowns.Load(); n != 2 {
+		t.Fatalf("want a shutdown on delete with nothing running, got %d", n)
+	}
+	c.Call(ctx, Request{Op: OpDelete, WorkspaceID: "22"})
 }
