@@ -152,7 +152,12 @@ func Start(ctx context.Context, req StartRequest) (StartResult, error) {
 		args = append(args, "-e", "GITHUB_CLONE_URL="+req.GithubCloneURL)
 	}
 	if req.HMACSecret != "" {
-		args = append(args, "-e", "HMAC_SECRET="+req.HMACSecret)
+		// The sidecar reads SIDECAR_HMAC_SECRET (sidecar.py). With only
+		// HMAC_SECRET set it ran with no secret at all, which it treats as
+		// "local dev, auth off": any local process could open its control
+		// WebSocket on the published 127.0.0.1 port. HMAC_SECRET stays for
+		// images that might still look for it.
+		args = append(args, "-e", "SIDECAR_HMAC_SECRET="+req.HMACSecret, "-e", "HMAC_SECRET="+req.HMACSecret)
 	}
 	args = append(args, req.Image)
 
