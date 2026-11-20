@@ -63,6 +63,7 @@ func (w logWriter) Write(p []byte) (int, error) {
 func runHostStart(args []string) error {
 	fs := flag.NewFlagSet("host start", flag.ExitOnError)
 	interval := fs.Duration("interval", defaultHeartbeat, "heartbeat interval")
+	noNativePrompt := fs.Bool("no-native-prompt", false, "macOS: don't offer to install the native runtime (set it up later with `sudo clux native install`)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -109,6 +110,10 @@ func runHostStart(args []string) error {
 	log.SetOutput(logWriter{logger})
 	defer logger.Flush()
 	logger.Printf("clux %s starting (log: %s)", version, logPath)
+
+	// macOS: offer the native runtime once (interactive only), or warn if
+	// it is installed but unhealthy. Never blocks docker-only mode.
+	newNativeOffer(cfg, *noNativePrompt, log.Printf).run()
 
 	h := newHostLoop(cfg, *interval, logger)
 	if nh := setupNative(ctx, cfg, stateDir); nh != nil {

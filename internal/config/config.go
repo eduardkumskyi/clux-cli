@@ -13,6 +13,9 @@ type Config struct {
 	BackendURL string `json:"backend_url"`
 	Token      string `json:"token"`
 	HostName   string `json:"host_name,omitempty"`
+	// NativePromptDeclined records a "no" to the native macOS runtime offer
+	// in `clux host start`, so it is not asked again.
+	NativePromptDeclined bool `json:"native_prompt_declined,omitempty"`
 }
 
 func dir() (string, error) {

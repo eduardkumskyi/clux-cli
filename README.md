@@ -35,6 +35,10 @@ clux doctor                  # sanity-check docker, credentials, connectivity
 clux host start               # register this machine and keep it online (foreground)
 ```
 
+On a Mac, the first interactive `clux host start` offers to set up the
+native macOS runtime for iOS/Xcode workspaces (see *Native macOS runtime*);
+answer `Y` and enter your admin password once, or `n` to keep Docker only.
+
 Run `clux help` for the full command list.
 
 ## Commands
@@ -45,7 +49,7 @@ Run `clux help` for the full command list.
 | `clux logout` | none | Removes stored credentials. |
 | `clux whoami` | none | Shows the identity of the currently configured host (dials the backend to re-verify stored credentials). |
 | `clux doctor` | none | Checks the local environment: Docker CLI reachability, whether the Docker daemon can actually run CPU/memory resource-limited containers (catches cgroup v2 "threaded mode" setups that reject `--cpus`/`--memory` before a workspace start fails the same way), stored credentials, system info collection, and backend connectivity. |
-| `clux host start` | `--interval <duration>` (default `30s`) | Registers this machine and keeps it online in the foreground: opens the tunnel, sends heartbeats on the given interval, and answers workspace lifecycle commands from the backend. Reconnects automatically (see *Connection resilience*). Only one instance runs per machine (`~/.clux/host.lock`). Exits cleanly on SIGINT/SIGTERM; running workspace containers are left running. |
+| `clux host start` | `--interval <duration>` (default `30s`)<br>`--no-native-prompt` (macOS: don't offer the native runtime) | Registers this machine and keeps it online in the foreground: opens the tunnel, sends heartbeats on the given interval, and answers workspace lifecycle commands from the backend. Reconnects automatically (see *Connection resilience*). Only one instance runs per machine (`~/.clux/host.lock`). Exits cleanly on SIGINT/SIGTERM; running workspace containers are left running. |
 | `clux native install` | `--owner <user>` (default: the account that ran `sudo`) | macOS, root. Sets up the native runtime for iOS/Xcode workspaces (see *Native macOS runtime*). Idempotent; re-run it after updating `clux` to update the daemons. |
 | `clux native uninstall` | `--purge` (also delete workspace files) | macOS, root. Removes the daemons, pf anchor, config and runtime. Deleting the hidden account needs Full Disk Access; without it the exact commands to finish are printed. |
 | `clux native status` | none | Shows the native runtime's state: account, daemons, pf, Seatbelt self-check, running workspaces. |
@@ -77,6 +81,19 @@ sudo clux native install     # once; then restart `clux host start`
 clux native status
 clux doctor                  # includes native checks
 ```
+
+**Setup from `clux host start`.** When native mode is not installed and
+`clux host start` runs in a terminal (stdin and stdout are TTYs), it asks
+once, default Yes (`[Y/n]`). Yes runs `sudo clux native install` on your
+terminal (sudo asks for the password), then host start continues; if the
+install fails, the error is printed and the host runs Docker workspaces
+only. No is remembered in `~/.clux/config.json` (`native_prompt_declined`)
+and not asked again; `--no-native-prompt` skips the question for one run.
+Without Xcode (`xcode-select -p` fails) it says native mode needs Xcode and
+does not ask. Non-interactive runs (launchd, CI) never prompt: they log one
+line suggesting `sudo clux native install`. When native mode is installed
+but the supervisor or pf firewall is not healthy, it logs one warning
+pointing at `clux doctor`.
 
 What `install` sets up:
 
