@@ -192,6 +192,21 @@ func Stop(ctx context.Context, containerName string) error {
 	return stopAndRemove(ctx, containerName)
 }
 
+// Running reports whether the named container exists and is running.
+func Running(ctx context.Context, containerName string) (bool, error) {
+	if containerName == "" {
+		return false, nil
+	}
+	out, err := runDocker(ctx, "inspect", "-f", "{{.State.Running}}", containerName)
+	if err != nil {
+		if isMissingContainer(err) || containsAny(err.Error(), "No such object", "no such object") {
+			return false, nil
+		}
+		return false, err
+	}
+	return strings.TrimSpace(out) == "true", nil
+}
+
 // DeleteResult is the "extra" fields merged into the workspace.delete
 // result frame on success.
 type DeleteResult struct {

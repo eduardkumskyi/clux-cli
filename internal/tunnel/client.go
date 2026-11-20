@@ -129,8 +129,11 @@ type registerAck struct {
 
 // Dial opens the tunnel connection and performs the register handshake.
 // On success the returned Session is ready for one-shot use (Close it when
-// done) or for Run (to enter the long-running full-duplex loop).
-func Dial(ctx context.Context, backendURL, token, cliVersion string, info sysinfo.Info) (*Session, error) {
+// done) or for Run (to enter the long-running full-duplex loop). caps, if
+// non-nil, is sent as the register frame's "capabilities" (the runtimes this
+// host offers); backends that predate it ignore the field, and a register
+// without it means docker only.
+func Dial(ctx context.Context, backendURL, token, cliVersion string, info sysinfo.Info, caps map[string]any) (*Session, error) {
 	wsURL, err := toWebsocketURL(backendURL)
 	if err != nil {
 		return nil, err
@@ -165,6 +168,9 @@ func Dial(ctx context.Context, backendURL, token, cliVersion string, info sysinf
 		"memory_mb":        info.MemoryMB,
 		"storage_gb_total": info.StorageGBTotal,
 		"cli_version":      cliVersion,
+	}
+	if caps != nil {
+		frame["capabilities"] = caps
 	}
 	_ = conn.SetWriteDeadline(time.Now().Add(DefaultWriteTimeout))
 	if err := conn.WriteJSON(frame); err != nil {
@@ -229,7 +235,7 @@ func (s *Session) LocalAddr() net.Addr { return s.conn.LocalAddr() }
 // one-shot callers (login/whoami/doctor never run the full-duplex loop).
 func (s *Session) Heartbeat(info sysinfo.Info, cliVersion string) error {
 	_ = s.conn.SetWriteDeadline(time.Now().Add(DefaultWriteTimeout))
-	if err := s.conn.WriteJSON(heartbeatFrame(info, cliVersion)); err != nil {
+	if err := s.conn.WriteJSON(heartbeatFrame(info, cliVersion, nil)); err != nil {
 		return fmt.Errorf("sending heartbeat: %w", err)
 	}
 	_ = s.conn.SetReadDeadline(time.Now().Add(registerTimeout))
@@ -245,14 +251,18 @@ func (s *Session) Heartbeat(info sysinfo.Info, cliVersion string) error {
 	return nil
 }
 
-func heartbeatFrame(info sysinfo.Info, cliVersion string) map[string]any {
-	return map[string]any{
+func heartbeatFrame(info sysinfo.Info, cliVersion string, caps map[string]any) map[string]any {
+	f := map[string]any{
 		"type":             "heartbeat",
 		"cpu_cores":        info.CPUCores,
 		"memory_mb":        info.MemoryMB,
 		"storage_gb_total": info.StorageGBTotal,
 		"cli_version":      cliVersion,
 	}
+	if caps != nil {
+		f["capabilities"] = caps
+	}
+	return f
 }
 
 // Close performs a graceful WebSocket close handshake before dropping the
@@ -276,9 +286,10 @@ func (s *Session) Close() error {
 // stall delivery of every other frame, including heartbeat_acks and
 // unrelated dial traffic, on this one connection.
 type Handler interface {
-	// HandleCommand processes one workspace.start/stop/delete frame and
-	// must eventually call Session.Send with a matching "result" frame
-	// (same correlation_id). Invoked in its own goroutine by the reader
+	// HandleCommand processes one workspace.start/stop/delete or
+	// egress.policy/decision frame and must eventually call Session.Send
+	// with a matching "result" frame (same correlation_id; egress frames
+	// only when they carry one). Invoked in its own goroutine by the reader
 	// loop already -- no further hand-off needed inside the method, but it
 	// still must not call back into the reader synchronously.
 	HandleCommand(ctx context.Context, frameType string, frame map[string]any)
@@ -508,9 +519,10 @@ func (s *Session) Ended() bool {
 	}
 }
 
-// SendHeartbeat is a convenience wrapper for the caller's ticker.
-func (s *Session) SendHeartbeat(info sysinfo.Info, cliVersion string) {
-	s.Send(heartbeatFrame(info, cliVersion))
+// SendHeartbeat is a convenience wrapper for the caller's ticker. caps is
+// included only when non-nil (the caller sends it when it changed).
+func (s *Session) SendHeartbeat(info sysinfo.Info, cliVersion string, caps map[string]any) {
+	s.Send(heartbeatFrame(info, cliVersion, caps))
 }
 
 func (s *Session) readLoop(ctx context.Context, h Handler) error {
@@ -549,7 +561,8 @@ func (s *Session) readLoop(ctx context.Context, h Handler) error {
 		case "heartbeat_ack", "register_ack":
 			// No-op: heartbeats don't block waiting for their ack anymore,
 			// and register_ack was already consumed by Dial.
-		case "workspace.start", "workspace.stop", "workspace.delete":
+		case "workspace.start", "workspace.stop", "workspace.delete",
+			"egress.policy", "egress.decision":
 			go h.HandleCommand(ctx, frameType, raw)
 		case "dial.open":
 			streamID, _ := raw["stream_id"].(string)

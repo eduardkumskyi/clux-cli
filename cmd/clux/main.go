@@ -3,7 +3,8 @@
 // online over a long-lived tunnel connection. Once registered, `host start`
 // also answers workspace.start/stop/delete lifecycle commands (docker
 // run/stop/rm against this machine's own Docker daemon, see
-// internal/dockerhost) and proxies dial.open/data/close stream frames to
+// internal/dockerhost; or, on a Mac with `clux native install`, the native
+// macOS runtime, see internal/native) and proxies dial.open/data/close stream frames to
 // locally-published container ports (internal/dialproxy), all multiplexed
 // over that same connection -- see internal/tunnel for the wire protocol
 // and internal/sysinfo for the capacity numbers reported.
@@ -66,6 +67,8 @@ func main() {
 		default:
 			err = fmt.Errorf("unknown host subcommand %q", args[0])
 		}
+	case "native":
+		err = runNative(args)
 	case "help", "-h", "--help":
 		printUsage()
 		return
@@ -93,6 +96,9 @@ commands:
   whoami                                      show the identity of the currently configured host
   doctor                                      check local environment (docker, config, connectivity)
   host start [--interval <duration>]          connect and keep this host registered (foreground)
+  native install [--owner <user>]             (macOS, root) set up the native runtime for iOS/Xcode workspaces
+  native uninstall [--purge]                  (macOS, root) remove the native runtime
+  native status                               show the native runtime's state
   version                                     print the CLI version`)
 }
 
@@ -112,7 +118,7 @@ func runLogin(args []string) error {
 		return fmt.Errorf("collecting system info: %w", err)
 	}
 
-	sess, err := tunnel.Dial(context.Background(), *backendURL, *token, version, info)
+	sess, err := tunnel.Dial(context.Background(), *backendURL, *token, version, info, nil)
 	if err != nil {
 		return fmt.Errorf("could not verify token: %w", err)
 	}
@@ -145,7 +151,7 @@ func runWhoami(args []string) error {
 		return fmt.Errorf("collecting system info: %w", err)
 	}
 
-	sess, err := tunnel.Dial(context.Background(), cfg.BackendURL, cfg.Token, version, info)
+	sess, err := tunnel.Dial(context.Background(), cfg.BackendURL, cfg.Token, version, info, nil)
 	if err != nil {
 		return fmt.Errorf("backend rejected stored credentials: %w", err)
 	}
@@ -176,13 +182,15 @@ func runDoctor(args []string) error {
 		info, infoErr := sysinfo.Collect(config.DefaultStorageRoot())
 		check("system info collection", infoErr)
 		if infoErr == nil {
-			sess, dialErr := tunnel.Dial(context.Background(), cfg.BackendURL, cfg.Token, version, info)
+			sess, dialErr := tunnel.Dial(context.Background(), cfg.BackendURL, cfg.Token, version, info, nil)
 			check("backend connectivity", dialErr)
 			if dialErr == nil {
 				sess.Close()
 			}
 		}
 	}
+
+	nativeDoctor(check)
 
 	if !allOK {
 		return fmt.Errorf("one or more checks failed")
