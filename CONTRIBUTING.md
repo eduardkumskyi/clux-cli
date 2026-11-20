@@ -43,7 +43,9 @@ This repo's existing code is the style guide. Specifically:
   relative path instead of failing).
 - Packages are small and focused on one concern (`internal/config`,
   `internal/tunnel`, `internal/dockerhost`, `internal/dialproxy`,
-  `internal/hostsession`, `internal/sysinfo`, `internal/apiclient`). Prefer
+  `internal/hostsession`, `internal/sysinfo`, `internal/egress`,
+  `internal/native`, `internal/supervisor`, `internal/sidecarrt`,
+  `internal/apiclient`). Prefer
   adding a new small package over growing an existing one into a grab bag.
 - No speculative abstraction — this codebase favors direct, readable code
   over extra layers of indirection added for flexibility nothing currently

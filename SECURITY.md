@@ -29,6 +29,50 @@ Out of scope: the inherent trust the user places in whatever backend they
 configured with `--backend-url`. Pointing out "the backend can tell the
 host to run containers" is the documented design, not a vulnerability.
 
+## Native macOS runtime
+
+`sudo clux native install` (opt-in, macOS) adds two LaunchDaemons: a root
+one (`clux native pfd`: pf anchor `com.apple/clux` + its pf enable token)
+and one running as the hidden user `_clux` (`clux native supervise`), plus
+a unix socket only the installing owner may use (0660 `_clux:_cluxctl` and a
+peer-uid check). Both run a root-owned copy of the binary in a directory
+whose whole parent chain is root-owned and not group/world-writable.
+Workspaces run as `_clux`; their network is forced through the egress
+proxy in `clux host start`.
+
+What we state to users (and treat as the security boundary):
+
+**Enforced by macOS (supported mechanisms):** the agent runs as a separate
+hidden user with no access to your home, files, Keychain, clipboard, apps or
+desktop; network leaves only through the clux proxy you control. **Extra
+layer:** Seatbelt sandbox (reported live). **Not covered:** macOS
+kernel/privilege-escalation vulnerabilities; world-readable files outside
+home (`/Users/Shared`, `/Applications`, `/opt/homebrew`); process names in
+`ps`.
+
+Further known limits (by design or documented, not vulnerabilities):
+
+- Workspaces on one Mac share the `_clux` user. Separation between them is
+  the Seatbelt layer; with `sandbox: unavailable`, one workspace's agent can
+  reach another's files and processes (never the owner's).
+- The iOS Simulator (CoreSimulatorService) runs outside Seatbelt as `_clux`;
+  user + pf are what confine it.
+- Outside Seatbelt, `_clux` can still resolve DNS names through the system
+  resolver and send ICMP (pf's user rules cover TCP/UDP only). Inside the
+  sandbox both are denied (verified).
+- On stop, the supervisor kills the workspace's process group and every
+  `_clux` process whose environment names the workspace. macOS hides the
+  environment of Apple platform binaries, so one of those that left the
+  process group (new session) survives until the next uninstall.
+- The agent may connect to its own loopback listeners (pf allows each port
+  only while every listener on it belongs to `_clux`, refreshed every
+  second by the root daemon); a new listener is unreachable for up to ~1 s.
+
+In scope for reports: anything that lets workspace code read or write the
+owner's files, talk to the owner's localhost services or the network
+without going through the proxy's policy, drive the supervisor socket
+without being the owner, or gain root via the daemons.
+
 ## Reporting a vulnerability
 
 **Please do not open a public GitHub issue for an unpatched
