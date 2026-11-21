@@ -117,7 +117,7 @@ func TestBackgroundNonInteractiveIsSilent(t *testing.T) {
 	}
 }
 
-func TestInstallServiceReportsAndWarnsOnTempBinary(t *testing.T) {
+func TestInstallServiceRefusesTempBinaryAndReports(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("no background service on Windows")
 	}
@@ -126,6 +126,21 @@ func TestInstallServiceReportsAndWarnsOnTempBinary(t *testing.T) {
 	m := &service.Manager{
 		GOOS: "darwin", Home: home, UID: 501, StateDir: filepath.Join(home, ".clux"),
 		Exe: filepath.Join(os.TempDir(), "go-build1/b001/exe/clux"),
+		Run: func(name string, args ...string) ([]byte, error) {
+			calls = append(calls, name)
+			return nil, nil
+		},
+	}
+	var out bytes.Buffer
+	err := installService(m, &config.Config{HostName: "My Mac"}, &out)
+	if err == nil || !strings.Contains(err.Error(), "temporary location") || len(calls) != 0 {
+		t.Fatalf("temp binary: err=%v calls=%v", err, calls)
+	}
+
+	calls = nil
+	m = &service.Manager{
+		GOOS: "darwin", Home: home, UID: 501, StateDir: filepath.Join(home, ".clux"),
+		Exe: "/opt/homebrew/bin/clux",
 		Run: func(name string, args ...string) ([]byte, error) {
 			line := name + " " + strings.Join(args, " ")
 			calls = append(calls, line)
@@ -139,12 +154,12 @@ func TestInstallServiceReportsAndWarnsOnTempBinary(t *testing.T) {
 		},
 		Sleep: func(time.Duration) {},
 	}
-	var out bytes.Buffer
+	out.Reset()
 	if err := installService(m, &config.Config{HostName: "My Mac"}, &out); err != nil {
 		t.Fatal(err)
 	}
 	s := out.String()
-	if !strings.Contains(s, "temporary location") || !strings.Contains(s, `Running "My Mac" in the background`) {
+	if !strings.Contains(s, `Running "My Mac" in the background`) {
 		t.Fatalf("output: %s", s)
 	}
 }
@@ -266,6 +281,35 @@ func TestPrintLogFollowsAppendsAndRotation(t *testing.T) {
 	cancel()
 	if err := <-done; err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestDescribeLiveAgent(t *testing.T) {
+	none := func() (int, bool) { return 0, false }
+	pid := func(n int) func() (int, bool) { return func() (int, bool) { return n, true } }
+	if s, ok := describeLiveAgent(pid(7), pid(7)); !ok || !strings.Contains(s, "background service (pid 7)") {
+		t.Fatal(s)
+	}
+	if s, ok := describeLiveAgent(none, pid(9)); !ok || !strings.Contains(s, "`clux host start` (pid 9)") {
+		t.Fatal(s)
+	}
+	if _, ok := describeLiveAgent(none, none); ok {
+		t.Fatal("nothing running: whoami/doctor may register")
+	}
+}
+
+func TestBackendReachableDoesNotRegister(t *testing.T) {
+	var paths []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		paths = append(paths, r.URL.Path)
+		w.WriteHeader(http.StatusNotFound) // any HTTP answer means reachable
+	}))
+	defer srv.Close()
+	if err := backendReachable(srv.URL); err != nil {
+		t.Fatal(err)
+	}
+	if len(paths) != 1 || paths[0] != "/" {
+		t.Fatalf("paths = %v (must not touch /ws/host/)", paths)
 	}
 }
 

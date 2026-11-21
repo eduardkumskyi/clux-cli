@@ -175,8 +175,12 @@ func Dial(ctx context.Context, backendURL, token, cliVersion string, info sysinf
 	}
 	// machine_id lets the backend recognize this computer as the same host
 	// across logins (one machine = one host). Older backends ignore it.
+	// machine_secret proves the id belongs to this computer.
 	if info.MachineID != "" {
 		frame["machine_id"] = info.MachineID
+		if info.MachineSecret != "" {
+			frame["machine_secret"] = info.MachineSecret
+		}
 	}
 	if caps != nil {
 		frame["capabilities"] = caps

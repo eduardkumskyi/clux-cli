@@ -50,8 +50,11 @@ The first `clux host start` in a terminal walks through everything once:
 
 **One computer = one host.** The CLI identifies the machine with a
 `machine_id` (a SHA-256 of the OS machine id and your OS user; the raw id is
-never sent), so logging in again on the same computer gets the same host
-back, with its projects, instead of a new one.
+never sent) plus a random `machine_secret` kept in `~/.clux/machine-key`
+(0600, survives `clux logout`). Logging in again on the same computer gets
+the same host back, with its projects, instead of a new one; the guessable
+id alone is never enough. Deleting `machine-key` makes the computer connect
+as a new host.
 
 Servers and CI without a browser: create a host in the dashboard and run
 `clux login --token <PAT>`, then `clux host start` (non-interactive runs
@@ -65,7 +68,7 @@ Run `clux help` for the full command list.
 | --- | --- | --- |
 | `clux login` | `--token <PAT>` (optional)<br>`--backend-url <url>` (default `https://api.clux.space`, or the one stored before) | Without `--token`: browser login. Prints `To connect this computer, open: <url> and confirm the code ABCD-EFGH`, opens the browser (not over SSH), polls until you confirm, deny, or the code expires (10 min). On a computer that was connected before, the backend returns the same host. With `--token`: verifies the token by registering once. Either way it stores credentials in `~/.clux/config.json` and restarts the background service if it runs. |
 | `clux logout` | none | Stops and removes the background service, then removes stored credentials (your answers to the one-time questions are kept). |
-| `clux whoami` | none | Shows the identity of the currently configured host (dials the backend to re-verify stored credentials). |
+| `clux whoami` | none | Shows the identity of the currently configured host (dials the backend to re-verify stored credentials). While `clux host start` or the background service runs, it answers from local config instead, since a second register would replace the live tunnel; `clux doctor` then only checks that the backend is reachable. |
 | `clux doctor` | none | Checks the local environment: Docker CLI reachability, whether the Docker daemon can actually run CPU/memory resource-limited containers (catches cgroup v2 "threaded mode" setups that reject `--cpus`/`--memory` before a workspace start fails the same way), stored credentials, system info collection, and backend connectivity. |
 | `clux host start` | `--foreground` (stay in this terminal, never offer the service; what the service runs)<br>`--background` (use the service even after an earlier "no")<br>`--interval <duration>` (default `30s`)<br>`--no-native-prompt` (macOS: don't offer the native runtime) | Registers this machine and keeps it online: opens the tunnel, sends heartbeats on the given interval, and answers workspace lifecycle commands from the backend. Reconnects automatically (see *Connection resilience*). In a terminal it first logs in if needed and offers the background service (see *Usage*); if the service already runs it says so and exits 0. Only one instance runs per machine (`~/.clux/host.lock`). Exits cleanly on SIGINT/SIGTERM; running workspace containers are left running. |
 | `clux host stop` | none | Stops the background service and removes it, so it does not start at the next login. If a `clux host start` runs in a terminal, says so (stop it with Ctrl+C there). |
@@ -93,8 +96,11 @@ See [`internal/tunnel`](internal/tunnel) for the wire protocol.
 
 `clux host start` answered with "yes" (or `--background`) installs a
 per-user service that runs `<clux binary> host start --foreground
---no-native-prompt` (the absolute path of the binary you ran, symlinks
-resolved; a binary in a temp dir or Go build cache gets a warning):
+--no-native-prompt` with a stable path to the binary you ran: the symlink
+you started it by or `clux` on your `PATH` (e.g. `/opt/homebrew/bin/clux`,
+which survives `brew upgrade`), not the versioned Cellar path behind it. A
+binary in a temp dir or Go build cache is refused (the host keeps running
+in the foreground):
 
 - **macOS:** LaunchAgent `~/Library/LaunchAgents/space.clux.host.plist` in
   your `gui/<uid>` domain (`launchctl bootstrap`), no root. Starts at login

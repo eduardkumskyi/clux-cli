@@ -9,6 +9,12 @@
 // MachineGuid); when none is readable a random UUID is generated once and
 // kept in ~/.clux/machine-id. The hash is not a secret, but the raw
 // platform id is never logged or sent.
+//
+// Because the id is derived from guessable inputs, it alone never proves
+// "same computer": the backend reuses a host only when the request also
+// carries the host's machine secret (Secret), 32 random bytes kept in
+// ~/.clux/machine-key. The key survives `clux logout` (that is what lets
+// the next login get the old host back) and is never logged.
 package machineid
 
 import (

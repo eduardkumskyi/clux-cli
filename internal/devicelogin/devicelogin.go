@@ -5,7 +5,7 @@
 //
 // Backend endpoints (all under /api/compute-hosts/, no auth on these two):
 //
-//	POST device-codes/       {machine_id, name, os, arch, cli_version}
+//	POST device-codes/       {machine_id, machine_secret, name, os, arch, cli_version}
 //	                         -> 201 {device_code, user_code, verification_url, expires_in, interval}
 //	POST device-codes/poll/  {device_code}
 //	                         -> 200 {status: pending|approved|denied|expired, slow_down?,
@@ -46,11 +46,14 @@ const (
 
 // Request describes this machine; Name is only the suggested host name.
 type Request struct {
-	MachineID  string `json:"machine_id"`
-	Name       string `json:"name"`
-	OS         string `json:"os"`
-	Arch       string `json:"arch"`
-	CLIVersion string `json:"cli_version"`
+	MachineID string `json:"machine_id"`
+	// MachineSecret proves this is the computer that owns the host with
+	// this machine_id (the id alone is guessable).
+	MachineSecret string `json:"machine_secret"`
+	Name          string `json:"name"`
+	OS            string `json:"os"`
+	Arch          string `json:"arch"`
+	CLIVersion    string `json:"cli_version"`
 }
 
 // Code is a started login, waiting for the user's confirmation.

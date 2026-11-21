@@ -137,9 +137,9 @@ func (o *backgroundOffer) ask() (yes, answered bool) {
 // The caller has released the host lock: the service needs it.
 func installService(svc *service.Manager, cfg *config.Config, out io.Writer) error {
 	if service.TemporaryBinary(svc.Exe, os.TempDir(), os.Getenv("GOCACHE")) {
-		fmt.Fprintf(out, "Warning: this clux binary is in a temporary location (%s).\n"+
-			"The background service stops working once it is deleted; install clux permanently\n"+
-			"(curl -fsSL https://clux.space/install.sh | sh) and run `clux host start` again.\n", svc.Exe)
+		// A service pointing here would break as soon as it is cleaned up.
+		return fmt.Errorf("this clux binary is in a temporary location (%s); install clux permanently "+
+			"(curl -fsSL https://clux.space/install.sh | sh) and run `clux host start` again", svc.Exe)
 	}
 	if err := svc.Install(); err != nil {
 		return err

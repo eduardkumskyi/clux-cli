@@ -77,18 +77,44 @@ func New(goos, stateDir string) (*Manager, error) {
 	}, nil
 }
 
-// Executable is the running binary's absolute path with symlinks resolved
-// (a Homebrew-style symlink may later point at another version; the
-// service should run what the user ran).
+// Executable is the path the service should run: a stable path that leads
+// to the running binary. Resolving symlinks all the way would land in a
+// versioned directory (Homebrew's Cellar/clux/0.5.0/bin/clux) that
+// `brew upgrade`/`brew cleanup` deletes, killing the service; the
+// symlink (/opt/homebrew/bin/clux) keeps working across upgrades.
 func Executable() (string, error) {
 	self, err := os.Executable()
 	if err != nil {
 		return "", fmt.Errorf("locating the clux binary: %w", err)
 	}
-	if p, err := filepath.EvalSymlinks(self); err == nil {
-		self = p
+	return StablePath(self, func() (string, error) { return exec.LookPath("clux") }, filepath.EvalSymlinks)
+}
+
+// StablePath picks, in order: the path the binary was started by if it is
+// a symlink to it (macOS reports it unresolved), else `clux` on PATH if it
+// leads to the same binary (Linux reports /proc/self/exe resolved), else
+// the resolved path itself. Temporary locations are never preferred.
+func StablePath(self string, lookPath func() (string, error), eval func(string) (string, error)) (string, error) {
+	self, err := filepath.Abs(self)
+	if err != nil {
+		return "", err
 	}
-	return filepath.Abs(self)
+	real, err := eval(self)
+	if err != nil {
+		real = self
+	}
+	temp := func(p string) bool { return TemporaryBinary(p, os.TempDir()) }
+	if self != real && !temp(self) {
+		return self, nil
+	}
+	if lp, err := lookPath(); err == nil {
+		if abs, err := filepath.Abs(lp); err == nil && !temp(abs) {
+			if r, err := eval(abs); err == nil && r == real {
+				return abs, nil
+			}
+		}
+	}
+	return real, nil
 }
 
 // TemporaryBinary reports whether exe looks like it will disappear (a

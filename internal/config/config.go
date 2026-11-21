@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 )
 
 // Answers to the background-service offer in `clux host start`.
@@ -120,7 +121,31 @@ func Save(cfg *Config) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(p, data, 0o600)
+	// Atomic: the service may read the file while `clux login` writes it,
+	// and a crash mid-write must not leave half a config. The temp file is
+	// created 0600 in the same directory (rename stays on one filesystem),
+	// so an older, looser file is replaced with 0600 too.
+	tmp, err := os.CreateTemp(d, ".config.json.tmp*")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(tmp.Name())
+	if err := tmp.Chmod(0o600); err != nil && runtime.GOOS != "windows" {
+		tmp.Close()
+		return err
+	}
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmp.Name(), p)
 }
 
 func Remove() error {

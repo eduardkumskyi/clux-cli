@@ -34,6 +34,32 @@ func TestOldConfigStillLoads(t *testing.T) {
 	}
 }
 
+func TestSaveIsAtomicAndTightensMode(t *testing.T) {
+	home := withHome(t)
+	dir := filepath.Join(home, ".clux")
+	_ = os.MkdirAll(dir, 0o700)
+	p := filepath.Join(dir, "config.json")
+	_ = os.WriteFile(p, []byte(`{"token":"old"}`), 0o644)
+	_ = os.Chmod(p, 0o644)
+	if err := Save(&Config{Token: "new"}); err != nil {
+		t.Fatal(err)
+	}
+	st, err := os.Stat(p)
+	if err != nil || st.Mode().Perm() != 0o600 {
+		t.Fatalf("mode %v, %v; want 0600", st.Mode().Perm(), err)
+	}
+	cfg, err := Load()
+	if err != nil || cfg.Token != "new" {
+		t.Fatalf("cfg = %+v, %v", cfg, err)
+	}
+	ents, _ := os.ReadDir(dir)
+	for _, e := range ents {
+		if e.Name() != "config.json" {
+			t.Fatalf("leftover temp file %s", e.Name())
+		}
+	}
+}
+
 func TestLogoutKeepsAnswers(t *testing.T) {
 	withHome(t)
 	if _, err := Load(); !errors.Is(err, ErrNotLoggedIn) {

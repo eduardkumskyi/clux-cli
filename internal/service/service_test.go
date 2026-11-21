@@ -190,9 +190,23 @@ func TestSystemdUnitContent(t *testing.T) {
 		"RestartSec=10\n",
 		"StandardOutput=append:" + m.LogPath(),
 		"WantedBy=default.target\n",
+		"\nWorkingDirectory=%h\n",
 	} {
 		if !strings.Contains(u, want) {
 			t.Errorf("unit lacks %q:\n%s", want, u)
+		}
+	}
+	// Settings systemd reads verbatim (no unquoting) must never be quoted.
+	for _, line := range strings.Split(u, "\n") {
+		k, v, ok := strings.Cut(line, "=")
+		if !ok {
+			continue
+		}
+		switch k {
+		case "WorkingDirectory", "StandardOutput", "StandardError", "Restart", "RestartSec", "Type", "WantedBy", "After", "Wants":
+			if strings.Contains(v, `"`) {
+				t.Errorf("%s must not be quoted: %q", k, line)
+			}
 		}
 	}
 	if m.File() != filepath.Join(m.Home, ".config", "systemd", "user", "clux-host.service") {
@@ -206,6 +220,10 @@ func TestSystemdUnitContent(t *testing.T) {
 
 func TestSystemdQuote(t *testing.T) {
 	if got := systemdQuote(`/a b/"x"/50%/$HOME\`); got != `"/a b/\"x\"/50%%/$$HOME\\"` {
+		t.Fatal(got)
+	}
+	// Environment= does not expand $, so it must not be doubled there.
+	if got := systemdEnvQuote(`PATH=/a $b/50%/"q"\`); got != `"PATH=/a $b/50%%/\"q\"\\"` {
 		t.Fatal(got)
 	}
 }
@@ -244,6 +262,45 @@ func TestUnsupported(t *testing.T) {
 	m := &Manager{GOOS: "windows"}
 	if m.Supported() || !errors.Is(m.Install(), ErrUnsupported) {
 		t.Fatal("windows has no service yet")
+	}
+}
+
+func TestStablePathKeepsSymlinkNotCellar(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX paths")
+	}
+	cellar := "/opt/homebrew/Cellar/clux/0.5.0/bin/clux"
+	links := map[string]string{
+		"/opt/homebrew/bin/clux": cellar,
+		cellar:                   cellar,
+		"/usr/local/bin/clux":    "/usr/local/bin/clux",
+	}
+	eval := func(p string) (string, error) {
+		if r, ok := links[p]; ok {
+			return r, nil
+		}
+		return "", errors.New("no such file")
+	}
+	noPath := func() (string, error) { return "", errors.New("not on PATH") }
+	onPath := func(p string) func() (string, error) { return func() (string, error) { return p, nil } }
+
+	cases := []struct {
+		name, self string
+		look       func() (string, error)
+		want       string
+	}{
+		// macOS: os.Executable is the symlink the user ran.
+		{"started via symlink", "/opt/homebrew/bin/clux", noPath, "/opt/homebrew/bin/clux"},
+		// Linux: os.Executable is already resolved; PATH has the symlink.
+		{"resolved, symlink on PATH", cellar, onPath("/opt/homebrew/bin/clux"), "/opt/homebrew/bin/clux"},
+		{"PATH clux is another binary", cellar, onPath("/usr/local/bin/clux"), cellar},
+		{"plain install", "/usr/local/bin/clux", noPath, "/usr/local/bin/clux"},
+	}
+	for _, c := range cases {
+		got, err := StablePath(c.self, c.look, eval)
+		if err != nil || got != c.want {
+			t.Errorf("%s: StablePath = %q, %v; want %q", c.name, got, err, c.want)
+		}
 	}
 }
 

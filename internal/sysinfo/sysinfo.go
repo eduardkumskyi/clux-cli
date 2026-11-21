@@ -16,6 +16,8 @@ type Info struct {
 	// MachineID (internal/machineid) is not collected here; the caller
 	// sets it, and only the register frame carries it.
 	MachineID string
+	// MachineSecret goes with MachineID (proof of possession); never log it.
+	MachineSecret string
 }
 
 // Collect gathers the current machine's capacity. storageRoot is created if

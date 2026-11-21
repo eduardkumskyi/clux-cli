@@ -85,14 +85,19 @@ func browserLogin(ctx context.Context, cfg *config.Config, backendURL string, ou
 	if err != nil {
 		return nil, fmt.Errorf("identifying this computer: %w", err)
 	}
+	secret, err := machineid.Secret(stateDir)
+	if err != nil {
+		return nil, fmt.Errorf("reading this computer's machine key: %w", err)
+	}
 	flow := &loginFlow{
 		client: &devicelogin.Client{BaseURL: backendURL, UserAgent: "clux/" + version},
 		req: devicelogin.Request{
-			MachineID:  mid,
-			Name:       suggestedHostName(),
-			OS:         runtime.GOOS,
-			Arch:       runtime.GOARCH,
-			CLIVersion: version,
+			MachineID:     mid,
+			MachineSecret: secret,
+			Name:          suggestedHostName(),
+			OS:            runtime.GOOS,
+			Arch:          runtime.GOARCH,
+			CLIVersion:    version,
 		},
 		out:  out,
 		open: browserOpener(),
@@ -193,9 +198,13 @@ func collectInfo() (sysinfo.Info, error) {
 	if err != nil {
 		return info, fmt.Errorf("collecting system info: %w", err)
 	}
+	// The id is only sent with its secret: an id the backend cannot verify
+	// is no use for reuse.
 	if dir, err := config.Dir(); err == nil {
-		if id, err := machineid.Get(dir); err == nil {
-			info.MachineID = id
+		id, idErr := machineid.Get(dir)
+		secret, secErr := machineid.Secret(dir)
+		if idErr == nil && secErr == nil {
+			info.MachineID, info.MachineSecret = id, secret
 		}
 	}
 	return info, nil

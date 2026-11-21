@@ -98,7 +98,7 @@ func (c *fakeClock) client(base string) *Client {
 func startAndWait(t *testing.T, fb *fakeBackend, clk *fakeClock) (*Result, error) {
 	t.Helper()
 	c := clk.client(fb.srv.URL + "/")
-	code, err := c.Start(context.Background(), Request{MachineID: strings.Repeat("a", 64), Name: "My Mac", OS: "darwin", Arch: "arm64", CLIVersion: "0.5.0"})
+	code, err := c.Start(context.Background(), Request{MachineID: strings.Repeat("a", 64), MachineSecret: strings.Repeat("s", 43), Name: "My Mac", OS: "darwin", Arch: "arm64", CLIVersion: "0.5.0"})
 	if err != nil {
 		t.Fatalf("Start: %v", err)
 	}
@@ -119,7 +119,7 @@ func TestApprovedAfterPending(t *testing.T) {
 	if res.Token != "pat" || res.Host.ID != 312 || res.Host.Name != "My Mac" || !res.Reused {
 		t.Fatalf("result = %+v", res)
 	}
-	if fb.started["machine_id"] != strings.Repeat("a", 64) || fb.started["name"] != "My Mac" ||
+	if fb.started["machine_id"] != strings.Repeat("a", 64) || fb.started["machine_secret"] != strings.Repeat("s", 43) || fb.started["name"] != "My Mac" ||
 		fb.started["os"] != "darwin" || fb.started["arch"] != "arm64" || fb.started["cli_version"] != "0.5.0" {
 		t.Fatalf("start body = %v", fb.started)
 	}

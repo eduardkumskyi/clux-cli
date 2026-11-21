@@ -14,6 +14,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
 	"os"
 	"os/exec"
 	"strings"
@@ -117,6 +118,13 @@ func runWhoami(args []string) error {
 	if err != nil {
 		return err
 	}
+	// A register would replace the running agent's tunnel (the backend keeps
+	// one per host): answer from local state instead.
+	if who, live := liveAgent(); live {
+		fmt.Printf("host %q (id=%d) backend=%s (from local config; %s holds the connection, see `clux host status`)\n",
+			cfg.HostName, cfg.HostID, cfg.BackendURL, who)
+		return nil
+	}
 	info, err := collectInfo()
 	if err != nil {
 		return err
@@ -129,6 +137,52 @@ func runWhoami(args []string) error {
 	defer sess.Close()
 
 	fmt.Printf("host %q (id=%d) backend=%s\n", sess.Name, sess.HostID, cfg.BackendURL)
+	return nil
+}
+
+// liveAgent reports whether a `clux host start` (background service or a
+// terminal) is running on this machine, and which.
+func liveAgent() (string, bool) {
+	return describeLiveAgent(
+		func() (int, bool) {
+			if svc, err := newService(); err == nil && svc.Supported() {
+				if st, err := svc.Status(); err == nil && st.Running {
+					return st.PID, true
+				}
+			}
+			return 0, false
+		},
+		func() (int, bool) {
+			dir, err := config.Dir()
+			if err != nil {
+				return 0, false
+			}
+			pid, held, _ := hostlockHolder(dir)
+			return pid, held
+		})
+}
+
+// describeLiveAgent checks the service first (to name it), then the host
+// lock, which any running `clux host start` holds.
+func describeLiveAgent(service, lock func() (int, bool)) (string, bool) {
+	if pid, ok := service(); ok {
+		return fmt.Sprintf("the background service (pid %d)", pid), true
+	}
+	if pid, ok := lock(); ok {
+		return fmt.Sprintf("`clux host start` (pid %d)", pid), true
+	}
+	return "", false
+}
+
+// backendReachable is a connectivity check that does not register: any
+// HTTP answer from the backend counts.
+func backendReachable(backendURL string) error {
+	c := &http.Client{Timeout: 10 * time.Second}
+	resp, err := c.Get(strings.TrimRight(backendURL, "/") + "/")
+	if err != nil {
+		return err
+	}
+	resp.Body.Close()
 	return nil
 }
 
@@ -152,7 +206,11 @@ func runDoctor(args []string) error {
 	if cfgErr == nil {
 		info, infoErr := collectInfo()
 		check("system info collection", infoErr)
-		if infoErr == nil {
+		if who, live := liveAgent(); live {
+			// Registering again would replace the live tunnel.
+			check(fmt.Sprintf("backend reachable (credentials not re-checked: %s is connected with them)", who),
+				backendReachable(cfg.BackendURL))
+		} else if infoErr == nil {
 			sess, dialErr := tunnel.Dial(context.Background(), cfg.BackendURL, cfg.Token, version, info, nil)
 			check("backend connectivity", dialErr)
 			if dialErr == nil {
