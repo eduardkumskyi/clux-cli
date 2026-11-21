@@ -73,9 +73,25 @@ func runSupervise(slot int) error {
 	if err != nil {
 		return err
 	}
+	s, ok := cfg.Slot(slot)
+	if !ok {
+		return fmt.Errorf("no slot %d in %s", slot, native.ConfigPath)
+	}
+	// The root half: bind the socket where only root can, then become the
+	// slot user for good, before anything else runs.
+	if os.Geteuid() != 0 {
+		return fmt.Errorf("`clux native supervise` is started as root by its LaunchDaemon (re-run `sudo clux native install`)")
+	}
+	l, err := native.ListenSlotSocket(cfg, s, logger.Printf)
+	if err != nil {
+		return fmt.Errorf("supervisor socket: %w", err)
+	}
+	if err := native.DropToSlot(cfg, s); err != nil {
+		return fmt.Errorf("dropping to %s: %w", s.User, err)
+	}
 	ctx, stop := daemonContext()
 	defer stop()
-	srv, err := supervisor.NewServer(supervisor.Options{Config: cfg, Slot: slot, Version: version, Logf: logger.Printf})
+	srv, err := supervisor.NewServer(supervisor.Options{Config: cfg, Slot: slot, Version: version, Logf: logger.Printf, Listener: l})
 	if err != nil {
 		return err
 	}
@@ -90,9 +106,9 @@ func runPFD() error {
 }
 
 // slotClient is the owner's client for slot n's supervisor; it refuses a
-// socket that isn't served by the slot's uid.
+// socket root did not create (anything the agent binds).
 func slotClient(s native.Slot) *supervisor.Client {
-	return &supervisor.Client{Socket: native.SlotSocket(s.N), ServerUID: s.UID}
+	return &supervisor.Client{Socket: native.SlotSocket(s.N), RootListener: true}
 }
 
 type slotStatus struct {
@@ -187,11 +203,33 @@ func runNativeStatus() error {
 			holds = "workspace " + strings.Join(s.resp.Resident, ", ")
 		}
 		fmt.Printf("version %s, sandbox %s, %s\n", s.resp.Version, s.resp.Sandbox, holds)
+		fmt.Printf("      root slot keeper: %s\n", keeperSummary(s.slot.N))
 		for _, w := range s.resp.Workspaces {
 			fmt.Printf("      workspace %s: running=%v pid=%d port=%d runtime=%s\n", w.ID, w.Running, w.PID, w.Port, w.RuntimeVersion)
 		}
 	}
 	return nil
+}
+
+// keeperSummary describes root's record of slot n.
+func keeperSummary(n int) string {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	st, err := (&native.KeeperClient{Socket: native.KeeperSocket}).State(ctx, n)
+	switch {
+	case err != nil:
+		return "unknown (" + err.Error() + ")"
+	case st.Busy:
+		return "wiping"
+	case st.ClaimedBy != "":
+		return "held by workspace " + st.ClaimedBy
+	case st.Free():
+		return "wiped, free"
+	case !st.Known:
+		return "no record yet (wiped before its first workspace)"
+	default:
+		return "NOT wiped since its last workspace (" + st.LastError + ")"
+	}
 }
 
 func launchdState(label string) string {
@@ -321,7 +359,8 @@ func setupNative(ctx context.Context, cfg *config.Config, stateDir string) *nati
 				}
 				return missingSlot(n)
 			},
-			Slots: slots,
+			Slots:  slots,
+			Keeper: &native.KeeperClient{Socket: native.KeeperSocket},
 			Installer: &sidecarrt.Installer{
 				Root: native.RuntimeRoot, BackendURL: cfg.BackendURL, Token: cfg.Token, Logf: log.Printf,
 			},

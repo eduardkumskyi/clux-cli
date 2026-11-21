@@ -39,7 +39,7 @@ func RunPFD(ctx context.Context, logf func(string, ...any)) error {
 	if err != nil {
 		return err
 	}
-	if err := ensureRunDirs(cfg, logf); err != nil {
+	if err := ensureRunDirs(cfg, false, logf); err != nil {
 		return err
 	}
 	d := &pfd{cfg: cfg, uids: cfg.AgentUIDs(), logf: logf, pf: execPfctl}
@@ -48,6 +48,16 @@ func RunPFD(ctx context.Context, logf func(string, ...any)) error {
 	d.load(base, true)
 	d.enable()
 	logf("pf daemon running (agent uids %v, proxy port %d)", d.uids, cfg.ProxyPort)
+
+	k, err := newKeeper(cfg, logf)
+	if err != nil {
+		return fmt.Errorf("slot keeper: %w", err)
+	}
+	kl, err := listenKeeper(cfg)
+	if err != nil {
+		return fmt.Errorf("slot keeper socket: %w", err)
+	}
+	go k.serve(ctx, kl)
 
 	t := time.NewTicker(time.Second)
 	defer t.Stop()
@@ -237,19 +247,32 @@ func (d *pfd) writeStatus() {
 
 // ensureRunDirs makes RunDir root:wheel 0755 (an older layout's RunDir was
 // owned by the agent: it is moved aside and deleted), SlotRunDir root:wheel
-// 0755 and one socket directory per slot (slot user:_cluxctl 0750); socket
-// directories of slots that no longer exist are removed.
-func ensureRunDirs(cfg *Config, logf func(string, ...any)) error {
+// 0755, StateDir root:wheel 0755 and, with slotDirs, one socket directory
+// per slot (root:_cluxctl 0750: the slot user can't enter it, so it can't
+// unlink or replace its supervisor's socket; an older layout's slot-owned
+// directory is replaced). Socket directories of slots that no longer exist
+// are removed. The pf daemon passes slotDirs=false: each supervisor's root
+// half creates its own directory when it starts.
+func ensureRunDirs(cfg *Config, slotDirs bool, logf func(string, ...any)) error {
 	if err := ensureDirReplacing(RunDir, 0o755, 0, 0, logf); err != nil {
 		return err
 	}
 	if err := ensureDirReplacing(SlotRunDir, 0o755, 0, 0, logf); err != nil {
 		return err
 	}
+	if err := ensureDirIn(AgentRoot, 0o755, 0, 0); err != nil {
+		return err
+	}
+	if err := ensureDirReplacing(StateDir, 0o755, 0, 0, logf); err != nil {
+		return err
+	}
 	want := map[string]bool{}
 	for _, s := range cfg.Slots {
 		want[strconv.Itoa(s.N)] = true
-		if err := ensureDirReplacing(SlotSocketDir(s.N), 0o750, s.UID, cfg.CtlGID, logf); err != nil {
+		if !slotDirs {
+			continue
+		}
+		if err := ensureDirReplacing(SlotSocketDir(s.N), 0o750, 0, cfg.CtlGID, logf); err != nil {
 			return err
 		}
 	}

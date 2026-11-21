@@ -4,11 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/eduardkumskyi/clux-cli/internal/egress"
+	"github.com/eduardkumskyi/clux-cli/internal/native"
 	"github.com/eduardkumskyi/clux-cli/internal/sidecarrt"
 	"github.com/eduardkumskyi/clux-cli/internal/supervisor"
 )
@@ -156,10 +158,14 @@ func TestNativeRuntimeStart(t *testing.T) {
 	sup := &fakeSupervisor{}
 	inst := &fakeInstaller{}
 	p := egress.New([]byte("k"), "")
-	n := &NativeRuntime{Supervisor: one(sup), Slots: testSlots(t, 1), Installer: inst, Egress: p, ProxyPort: 47821}
+	kp := &fakeKeeper{}
+	n := &NativeRuntime{Supervisor: one(sup), Slots: testSlots(t, 1), Keeper: kp, Installer: inst, Egress: p, ProxyPort: 47821}
 	res, err := n.Start(context.Background(), decode(t, nativeStart))
 	if err != nil {
 		t.Fatal(err)
+	}
+	if len(kp.log) != 1 || kp.log[0] != "claim 1 12" {
+		t.Fatalf("root claim before the start: %v", kp.log)
 	}
 	if res["sidecar_port"] != 40001 {
 		t.Fatalf("result %v", res)
@@ -181,7 +187,7 @@ func TestNativeRuntimeStart(t *testing.T) {
 }
 
 func TestNativeRuntimeValidatesInput(t *testing.T) {
-	n := &NativeRuntime{Supervisor: one(&fakeSupervisor{}), Slots: testSlots(t, 2), Installer: &fakeInstaller{}, Egress: egress.New([]byte("k"), ""), ProxyPort: 47821}
+	n := &NativeRuntime{Supervisor: one(&fakeSupervisor{}), Slots: testSlots(t, 2), Keeper: &fakeKeeper{}, Installer: &fakeInstaller{}, Egress: egress.New([]byte("k"), ""), ProxyPort: 47821}
 	for _, mut := range []func(map[string]any){
 		func(f map[string]any) { delete(f, "sidecar_bundle") },
 		func(f map[string]any) { delete(f, "hmac_secret") },
@@ -200,7 +206,8 @@ func TestNativeRuntimeDeleteAndErrors(t *testing.T) {
 	sup := &fakeSupervisor{}
 	p := egress.New([]byte("k"), "")
 	p.SetPolicy("12", egress.Policy{})
-	n := &NativeRuntime{Supervisor: one(sup), Slots: testSlots(t, 2), Installer: &fakeInstaller{}, Egress: p, ProxyPort: 47821}
+	kp := &fakeKeeper{}
+	n := &NativeRuntime{Supervisor: one(sup), Slots: testSlots(t, 2), Keeper: kp, Installer: &fakeInstaller{}, Egress: p, ProxyPort: 47821}
 	if _, err := n.Slots.Assign("12", nil); err != nil {
 		t.Fatal(err)
 	}
@@ -217,6 +224,15 @@ func TestNativeRuntimeDeleteAndErrors(t *testing.T) {
 	if _, ok := n.Slots.Lookup("12"); ok || n.Slots.Free() != 1 {
 		t.Fatal("delete must free the slot")
 	}
+	// The wipe is root's; the supervisor (the agent's uid) is not asked.
+	if len(kp.log) != 1 || kp.log[0] != "wipe 1 12" {
+		t.Fatalf("keeper calls %v", kp.log)
+	}
+	for _, r := range sup.reqs {
+		if r.Op == supervisor.OpDelete {
+			t.Fatal("delete went to the supervisor")
+		}
+	}
 	// Never started: nothing to stop or delete, no supervisor call.
 	calls := len(sup.reqs)
 	if err := n.Stop(context.Background(), decode(t, `{"workspace_id":99}`)); err != nil {
@@ -232,11 +248,117 @@ func TestNativeRuntimeDeleteAndErrors(t *testing.T) {
 	if err := n.Stop(context.Background(), decode(t, `{"workspace_id":13}`)); err == nil {
 		t.Fatal("supervisor error swallowed")
 	}
+	kp.wipeErr = errors.New("processes of uid 405 keep coming back")
 	if _, err := n.Delete(context.Background(), decode(t, `{"workspace_id":13}`)); err == nil {
-		t.Fatal("supervisor error swallowed")
+		t.Fatal("wipe error swallowed")
 	}
 	if _, ok := n.Slots.Lookup("13"); !ok {
 		t.Fatal("a failed delete must keep the slot (its files are still there)")
+	}
+}
+
+// fakeKeeper models root's slot keeper: slots are wiped and free unless
+// states says otherwise.
+type fakeKeeper struct {
+	states  map[int]native.SlotState
+	wipeErr error
+	log     []string
+}
+
+func (f *fakeKeeper) state(n int) native.SlotState {
+	if st, ok := f.states[n]; ok {
+		return st
+	}
+	return native.SlotState{Slot: n, Known: true, Clean: true}
+}
+
+func (f *fakeKeeper) set(st native.SlotState) {
+	if f.states == nil {
+		f.states = map[int]native.SlotState{}
+	}
+	f.states[st.Slot] = st
+}
+
+func (f *fakeKeeper) State(_ context.Context, n int) (native.SlotState, error) {
+	return f.state(n), nil
+}
+
+func (f *fakeKeeper) Claim(_ context.Context, n int, id string) error {
+	f.log = append(f.log, fmt.Sprintf("claim %d %s", n, id))
+	st := f.state(n)
+	switch {
+	case st.ClaimedBy == id:
+		return nil
+	case st.ClaimedBy != "" || st.Busy || st.Known && !st.Clean:
+		return fmt.Errorf("slot %d not claimable: %+v", n, st)
+	}
+	st.Known, st.ClaimedBy, st.Clean = true, id, false
+	f.set(st)
+	return nil
+}
+
+func (f *fakeKeeper) Wipe(_ context.Context, n int, id string) (int64, error) {
+	f.log = append(f.log, fmt.Sprintf("wipe %d %s", n, id))
+	if f.wipeErr != nil {
+		return 0, f.wipeErr
+	}
+	if st := f.state(n); st.ClaimedBy != "" && st.ClaimedBy != id {
+		return 0, fmt.Errorf("slot %d held by %s", n, st.ClaimedBy)
+	}
+	f.set(native.SlotState{Slot: n, Known: true, Clean: true})
+	return 3 << 30, nil
+}
+
+// Finding: a slot went to the next workspace without root removing what
+// the previous agent left (crontab, launchd jobs, processes). A new
+// workspace only gets a slot root reports wiped; a slot root has not wiped
+// since its last holder is wiped first; slots root reports held or busy,
+// or whose wipe fails, are skipped.
+func TestNativeRuntimeReusesOnlyRootWipedSlots(t *testing.T) {
+	kp := &fakeKeeper{}
+	kp.set(native.SlotState{Slot: 1, Known: true, ClaimedBy: "99"}) // held (host map lost)
+	kp.set(native.SlotState{Slot: 2, Known: true, Clean: true, Busy: true})
+	kp.set(native.SlotState{Slot: 3, Known: true}) // released, never wiped
+	sups := map[int]*fakeSupervisor{1: {}, 2: {}, 3: {}, 4: {}}
+	n := &NativeRuntime{
+		Supervisor: func(i int) SupervisorCaller { return sups[i] },
+		Slots:      testSlots(t, 4), Keeper: kp, Installer: &fakeInstaller{}, Egress: egress.New([]byte("k"), ""), ProxyPort: 47821,
+	}
+	start := func(id string) error {
+		f := decode(t, nativeStart)
+		f["workspace_id"] = id
+		_, err := n.Start(context.Background(), f)
+		return err
+	}
+	if err := start("12"); err != nil {
+		t.Fatal(err)
+	}
+	if s, _ := n.Slots.Lookup("12"); s != 3 {
+		t.Fatalf("12 -> slot %d, want 3 (after a wipe)", s)
+	}
+	if strings.Join(kp.log, ",") != "wipe 3 ,claim 3 12" {
+		t.Fatalf("keeper calls %v", kp.log)
+	}
+
+	// A dirty slot whose wipe fails is never handed out.
+	kp.log = nil
+	kp.set(native.SlotState{Slot: 4, Known: true})
+	kp.wipeErr = errors.New("wipe failed")
+	if err := start("13"); err == nil {
+		t.Fatal("got a slot although the only candidate could not be wiped")
+	}
+	kp.wipeErr = nil
+
+	// A pre-keeper slot holding only this workspace's files is continued
+	// (Claim adopts), without a wipe.
+	kp.log = nil
+	kp.set(native.SlotState{Slot: 4})
+	sups[4].resident = []string{"14"}
+	if err := start("14"); err != nil {
+		t.Fatal(err)
+	}
+	if s, _ := n.Slots.Lookup("14"); s != 4 || strings.Contains(strings.Join(kp.log, ","), "wipe") {
+		t.Fatalf("14 -> slot %d, calls %v", s, kp.log)
 	}
 }
 
@@ -261,7 +383,7 @@ func TestNativeRuntimeAssignsSlots(t *testing.T) {
 	slots, _ := LoadSlotMap(path, 3)
 	n := &NativeRuntime{
 		Supervisor: func(i int) SupervisorCaller { return sups[i] },
-		Slots:      slots, Installer: &fakeInstaller{}, Egress: egress.New([]byte("k"), ""), ProxyPort: 47821,
+		Slots:      slots, Keeper: &fakeKeeper{}, Installer: &fakeInstaller{}, Egress: egress.New([]byte("k"), ""), ProxyPort: 47821,
 	}
 	start := func(id string) error {
 		f := decode(t, nativeStart)

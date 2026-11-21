@@ -23,10 +23,23 @@
 //  3. Seatbelt (sandbox-exec), per workspace: a secondary layer, because the
 //     iOS Simulator runs outside it and Apple has deprecated it.
 //
-// Root never acts on paths a slot user can write: it creates each slot's
-// home and socket directory as entries of root-owned directories (checked
-// with lstat + O_NOFOLLOW, see safefs_darwin.go) and leaves everything
-// inside them to the slot's own supervisor.
+// The supervisor runs as the slot user, i.e. the same uid as the (hostile)
+// agent, so nothing the supervisor does can be relied on to remove the
+// agent: a slot is handed to the next workspace only after root (the slot
+// keeper in the pf daemon, keeper_darwin.go) has removed everything the uid
+// left behind -- launchd user/gui domains, crontab and at jobs, every
+// process, simulators, the home and the uid's temp dirs -- and recorded the
+// slot clean in a root-owned state file. Each supervisor's socket is created
+// by root (the supervisor starts as root, binds it in a root-owned directory
+// the slot can't enter, then drops to the slot uid), so the owner's client
+// authenticates it by its listen-time credentials (uid 0), which the agent
+// can't fake.
+//
+// Root never acts on paths a slot user can write while that user can still
+// act: it creates each slot's home as an entry of a root-owned directory
+// (checked with lstat + O_NOFOLLOW, see safefs_darwin.go), and it wipes a
+// home only after every process of the uid is gone, by renaming it inside
+// the root-owned parent first.
 package native
 
 import (
@@ -82,8 +95,15 @@ const (
 	PFTokenPath     = RunDir + "/pf.token"
 	PFEffectivePath = RunDir + "/pf.effective.rules"
 	// SlotRunDir (root:wheel 0755) holds one socket directory per slot
-	// (<n>, slot user:_cluxctl 0750).
+	// (<n>, root:_cluxctl 0750, the socket in it root:_cluxctl 0660).
 	SlotRunDir = RunDir + "/slots"
+	// KeeperSocket is the root slot keeper's socket (root:_cluxctl 0660):
+	// claim, state and wipe of slots, for the owner only.
+	KeeperSocket = RunDir + "/keeper.sock"
+	// StateDir (root:wheel 0755) holds the keeper's per-slot state
+	// (<n>.json, root:wheel 0644): which workspace holds the slot, and
+	// whether root has wiped it since. It survives reboots.
+	StateDir = AgentRoot + "/state"
 
 	LogDir = "/private/var/log/clux-native"
 

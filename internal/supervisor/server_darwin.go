@@ -65,6 +65,16 @@ type Options struct {
 	// slot (nil = it is). Default: the root pf daemon's status must be
 	// active and cover this slot's uid.
 	PFCheck func() error
+	// SlotClaim reports why workspace id may not start in this slot (nil =
+	// it may). Default: root's slot keeper must have recorded id as the
+	// slot's holder (a claim only succeeds on a slot root wiped), so a
+	// workspace never starts into what an earlier one left behind. With
+	// SkipUIDCheck it defaults to no check.
+	SlotClaim func(id string) error
+	// Listener, if set, is the socket to serve: the one root bound before
+	// dropping to the slot user (see native.ListenSlotSocket). Without it
+	// (tests) Serve binds Socket itself.
+	Listener net.Listener
 }
 
 // Server is a running supervisor for one slot. A slot holds at most one
@@ -133,6 +143,14 @@ func NewServer(opts Options) (*Server, error) {
 		uid := slot.UID
 		opts.PFCheck = func() error { return pfCheck(uid) }
 	}
+	if opts.SlotClaim == nil {
+		if opts.SkipUIDCheck {
+			opts.SlotClaim = func(string) error { return nil }
+		} else {
+			n := slot.N
+			opts.SlotClaim = func(id string) error { return slotClaim(n, id) }
+		}
+	}
 	if !opts.SkipUIDCheck && os.Getuid() != slot.UID {
 		return nil, fmt.Errorf("supervisor for slot %d must run as %s (uid %d), not uid %d", slot.N, slot.User, slot.UID, os.Getuid())
 	}
@@ -164,6 +182,18 @@ func pfCheck(uid int) error {
 	}
 	if !st.Covers(uid) {
 		return fmt.Errorf("pf rules do not cover uid %d (re-run `sudo clux native install`)", uid)
+	}
+	return nil
+}
+
+// slotClaim: root's record of slot n must name workspace id as its holder.
+func slotClaim(n int, id string) error {
+	st, err := native.ReadSlotState(n)
+	if err != nil {
+		return fmt.Errorf("slot state unavailable: %w", err)
+	}
+	if st.ClaimedBy != id {
+		return fmt.Errorf("root's slot keeper has not assigned slot %d to workspace %s (holder %q)", n, id, st.ClaimedBy)
 	}
 	return nil
 }
@@ -212,33 +242,20 @@ func (s *Server) prepareHome() error {
 	return nil
 }
 
-// Serve listens on the socket until ctx ends. The socket's directory is
-// created by the root pf daemon at boot; wait for it rather than failing
-// (launchd starts the daemons in no particular order).
+// Serve accepts on the socket until ctx ends: opts.Listener (bound by the
+// root half), or -- in tests -- a socket it binds at opts.Socket.
 func (s *Server) Serve(ctx context.Context) error {
-	dir := filepath.Dir(s.opts.Socket)
-	for i := 0; ; i++ {
-		if st, err := os.Stat(dir); err == nil && st.IsDir() {
-			break
+	l := s.opts.Listener
+	if l == nil {
+		_ = os.Remove(s.opts.Socket)
+		var err error
+		if l, err = net.Listen("unix", s.opts.Socket); err != nil {
+			return err
 		}
-		if i == 0 {
-			s.opts.Logf("waiting for %s (created by the pf daemon)", dir)
+		if err := os.Chmod(s.opts.Socket, 0o660); err != nil {
+			l.Close()
+			return err
 		}
-		select {
-		case <-ctx.Done():
-			return nil
-		case <-time.After(time.Second):
-		}
-	}
-	_ = os.Remove(s.opts.Socket)
-	l, err := net.Listen("unix", s.opts.Socket)
-	if err != nil {
-		return err
-	}
-	// Group comes from the directory (_cluxctl, BSD semantics).
-	if err := os.Chmod(s.opts.Socket, 0o660); err != nil {
-		l.Close()
-		return err
 	}
 	s.opts.Logf("slot %d (%s) listening on %s (sandbox: %s)", s.slot.N, s.slot.User, s.opts.Socket, s.sandbox)
 	go func() {
@@ -352,6 +369,9 @@ func (s *Server) start(ctx context.Context, req Request) (int, error) {
 	// and the owner's localhost: refuse rather than start unconfined.
 	if err := s.opts.PFCheck(); err != nil {
 		return 0, fmt.Errorf("refusing to start: %w; see `clux doctor`", err)
+	}
+	if err := s.opts.SlotClaim(req.WorkspaceID); err != nil {
+		return 0, fmt.Errorf("refusing to start: %w", err)
 	}
 	var port int
 	err = s.withLock(ctx, func() error {
@@ -747,23 +767,7 @@ func (s *Server) selfCheck() string {
 
 // --- helpers -----------------------------------------------------------------
 
-func peerUID(c *net.UnixConn) (int, error) {
-	raw, err := c.SyscallConn()
-	if err != nil {
-		return -1, err
-	}
-	var cred *unix.Xucred
-	var cerr error
-	if err := raw.Control(func(fd uintptr) {
-		cred, cerr = unix.GetsockoptXucred(int(fd), unix.SOL_LOCAL, unix.LOCAL_PEERCRED)
-	}); err != nil {
-		return -1, err
-	}
-	if cerr != nil {
-		return -1, cerr
-	}
-	return int(cred.Uid), nil
-}
+func peerUID(c *net.UnixConn) (int, error) { return native.PeerUID(c) }
 
 // freePortPair picks p such that p (WebSocket) and p+1 (the sidecar's
 // health/HTTP server) are free on IPv4 and IPv6 wildcard addresses.

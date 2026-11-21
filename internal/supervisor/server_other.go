@@ -5,6 +5,7 @@ package supervisor
 import (
 	"context"
 	"errors"
+	"net"
 
 	"github.com/eduardkumskyi/clux-cli/internal/native"
 )
@@ -19,6 +20,7 @@ type Options struct {
 	RuntimeRoot  string
 	SkipUIDCheck bool
 	Logf         func(format string, args ...any)
+	Listener     net.Listener
 }
 
 // Server is a running supervisor (macOS only).

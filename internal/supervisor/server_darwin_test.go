@@ -335,13 +335,42 @@ func TestStartRefusedWithoutPF(t *testing.T) {
 	}
 }
 
-func TestClientChecksServerUID(t *testing.T) {
-	s, _ := testServer(t, os.Getuid())
-	if _, err := (&Client{Socket: s.opts.Socket, ServerUID: os.Getuid()}).Call(context.Background(), Request{Op: OpStatus}); err != nil {
-		t.Fatalf("right server uid rejected: %v", err)
+// Finding: the agent shares its supervisor's uid, so it could stop the
+// supervisor and bind a socket of its own; a client checking for "the slot
+// uid" would accept it. The owner's client insists on a socket root
+// created, which a non-root process -- here the test user, standing in for
+// the agent -- can't provide: nothing is sent to it.
+func TestClientRefusesSocketNotCreatedByRoot(t *testing.T) {
+	s, rt := testServer(t, os.Getuid())
+	if _, err := (&Client{Socket: s.opts.Socket}).Call(context.Background(), Request{Op: OpStatus}); err != nil {
+		t.Fatalf("plain client: %v", err)
 	}
-	_, err := (&Client{Socket: s.opts.Socket, ServerUID: os.Getuid() + 1}).Call(context.Background(), Request{Op: OpStatus})
+	_, err := (&Client{Socket: s.opts.Socket, RootListener: true}).Call(context.Background(),
+		startReq(t, "41", rt))
 	if err == nil || !strings.Contains(err.Error(), "refusing to use it") {
-		t.Fatalf("socket served by another uid accepted: %v", err)
+		t.Fatalf("a socket the test user bound was accepted: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(s.workspacesDir(), "41")); !os.IsNotExist(err) {
+		t.Fatal("the start request reached the server")
+	}
+}
+
+func startReq(t *testing.T, id, rt string) Request {
+	return Request{Op: OpStart, WorkspaceID: id, HMACSecret: "s", ProxyURL: "http://ws-" + id + ":pw@127.0.0.1:47821", Runtime: fakeRuntime(t, rt)}
+}
+
+// The supervisor refuses a workspace root's keeper has not given the slot.
+func TestStartRefusedWithoutRootClaim(t *testing.T) {
+	s, rt := testServerWith(t, os.Getuid(), func(o *Options) {
+		o.SlotClaim = func(id string) error {
+			return errors.New("root's slot keeper has not assigned slot 1 to workspace " + id)
+		}
+	})
+	resp := s.Dispatch(context.Background(), startReq(t, "41", rt))
+	if resp.OK || !strings.Contains(resp.Error, "has not assigned slot 1") {
+		t.Fatalf("started without a claim: %+v", resp)
+	}
+	if _, err := os.Stat(filepath.Join(s.workspacesDir(), "41")); !os.IsNotExist(err) {
+		t.Fatal("workspace dir created although the start was refused")
 	}
 }

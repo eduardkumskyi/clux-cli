@@ -348,7 +348,7 @@ func TestPlistsAreWellFormed(t *testing.T) {
 	s := SupervisorPlist("/x/clux", 3)
 	for _, want := range []string{
 		"<key>Label</key><string>space.clux.native.supervisor.3</string>",
-		"<key>UserName</key><string>_clux3</string>", "<key>GroupName</key><string>_clux3</string>",
+		"<key>USER</key><string>_clux3</string>",
 		"<string>supervise</string>", "<string>--slot</string>\n    <string>3</string>",
 		"<key>HOME</key><string>/private/var/clux/slots/3</string>",
 		"<string>/private/var/log/clux-native/supervisor-3.log</string>", "<key>KeepAlive</key><true/>",
@@ -359,6 +359,11 @@ func TestPlistsAreWellFormed(t *testing.T) {
 	}
 	if strings.Contains(PFDaemonPlist("/x/clux"), "UserName") {
 		t.Error("pf daemon must run as root")
+	}
+	// The supervisor starts as root (it binds its socket, then drops to
+	// the slot user itself).
+	if strings.Contains(s, "UserName") || strings.Contains(s, "GroupName") {
+		t.Error("supervisor plist must not set UserName/GroupName")
 	}
 }
 

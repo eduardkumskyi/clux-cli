@@ -76,10 +76,6 @@ func TestRootReinstallRefusesAgentSymlinks(t *testing.T) {
 		{"/bin/ln", "-s", vfile, home2 + "/Library/Developer/Xcode/SDKToSimulatorIndexMapping.plist"},
 		// Hard link to a root file in the agent's home.
 		{"/bin/ln", "-f", vfile, home2 + "/hardlink"},
-		// The slot's own socket dir: names root used to write in the run dir.
-		{"/bin/ln", "-sf", vfile, SlotSocketDir(s1.N) + "/pf.json"},
-		{"/bin/ln", "-sf", vfile, SlotSocketDir(s1.N) + "/pf.json.tmp"},
-		{"/bin/ln", "-sf", vfile, SlotSocketDir(s1.N) + "/pf.token.tmp"},
 	}
 	for _, p := range plants {
 		s := s1
@@ -91,8 +87,7 @@ func TestRootReinstallRefusesAgentSymlinks(t *testing.T) {
 		}
 	}
 	defer func() {
-		_ = as(s1, "/bin/rm", "-rf", home1+"/Library/Developer/Xcode", home1+"/Library/Logs",
-			SlotSocketDir(s1.N)+"/pf.json", SlotSocketDir(s1.N)+"/pf.json.tmp", SlotSocketDir(s1.N)+"/pf.token.tmp")
+		_ = as(s1, "/bin/rm", "-rf", home1+"/Library/Developer/Xcode", home1+"/Library/Logs")
 		_ = as(s2, "/bin/rm", "-f", home2+"/Library/Developer/Xcode/SDKToSimulatorIndexMapping.plist", home2+"/hardlink")
 		for _, s := range []Slot{s1, s2} {
 			_, _ = run("/bin/launchctl", "kickstart", "-k", "system/"+SupervisorLabel(s.N))
@@ -109,6 +104,12 @@ func TestRootReinstallRefusesAgentSymlinks(t *testing.T) {
 		{s1, []string{"/bin/mkdir", RunDir + "/x"}},
 		{s1, []string{"/bin/mkdir", SlotsDir + "/99"}},
 		{s1, []string{"/usr/bin/touch", SlotSocketDir(s2.N) + "/supervisor.sock.x"}},
+		// Its own socket dir is root's now: no plants, no unlinking the socket.
+		{s1, []string{"/bin/ln", "-sf", vfile, SlotSocketDir(s1.N) + "/pf.json"}},
+		{s1, []string{"/bin/rm", "-f", SlotSocket(s1.N)}},
+		{s1, []string{"/bin/ls", SlotSocketDir(s1.N)}},
+		{s1, []string{"/usr/bin/touch", StateDir + "/1.json"}},
+		{s1, []string{"/usr/bin/touch", LogDir + "/supervisor-1.log"}},
 		{s1, []string{"/bin/ls", home2}},
 		{s1, []string{"/usr/bin/touch", RuntimeRoot + "/sidecar/x"}},
 	} {

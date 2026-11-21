@@ -138,7 +138,7 @@ func Install(opts InstallOptions) error {
 		{AgentRoot, 0o755, 0, 0},
 		{SlotsDir, 0o755, 0, 0},
 		{SharedDir, 0o755, 0, 0},
-		{LogDir, 0o755, 0, ctlGID}, // 0755: launchd opens each supervisor's log as its slot user
+		{LogDir, 0o750, 0, ctlGID}, // the owner reads the logs; the slots don't
 		{ConfigDir, 0o755, 0, 0},
 	} {
 		if err := ensureDirIn(d.path, d.mode, d.uid, d.gid); err != nil {
@@ -157,7 +157,10 @@ func Install(opts InstallOptions) error {
 		return err
 	}
 	for _, s := range slots {
-		if err := ensureFileIn(SupervisorLog(s.N), 0o640, s.UID, ctlGID); err != nil {
+		// root:_cluxctl: launchd opens it as root (the supervisor starts as
+		// root), so the agent, which shares the supervisor's uid afterwards,
+		// can't rewrite its own supervisor's log.
+		if err := ensureFileIn(SupervisorLog(s.N), 0o640, 0, ctlGID); err != nil {
 			return err
 		}
 	}
@@ -208,7 +211,7 @@ func Install(opts InstallOptions) error {
 	if err := cfg.Validate(); err != nil {
 		return err
 	}
-	if err := ensureRunDirs(&cfg, func(f string, a ...any) { warn(f, a...) }); err != nil {
+	if err := ensureRunDirs(&cfg, true, func(f string, a ...any) { warn(f, a...) }); err != nil {
 		return err
 	}
 	b, _ := json.MarshalIndent(cfg, "", "  ")
@@ -531,14 +534,11 @@ func removeSlot(out io.Writer, s Slot) {
 	fmt.Fprintf(out, "[ OK ] removed slot %d (%s)\n", s.N, s.User)
 }
 
-// stopSlot stops slot n's supervisor and every process of its user.
+// stopSlot stops slot n's supervisor, removes what its user scheduled
+// (crontab, at jobs) and kills every process of the user, launchd user/gui
+// domains included, until none comes back.
 func stopSlot(n, uid int) {
-	_, _ = run("/bin/launchctl", "bootout", "system/"+SupervisorLabel(n))
-	if inIDRange(uid) {
-		killUser(uid)
-		_, _ = run("/bin/launchctl", "bootout", "user/"+strconv.Itoa(uid))
-		_, _ = run("/bin/launchctl", "bootout", "gui/"+strconv.Itoa(uid))
-	}
+	purgeUID(Slot{N: n, User: SlotUser(n), UID: uid}, func(string, ...any) {})
 }
 
 // bootstrapDaemon (re)writes a LaunchDaemon plist and (re)loads it.
@@ -730,7 +730,9 @@ func Uninstall(opts UninstallOptions) error {
 			}
 		}
 	}
-	paths := []string{ConfigDir, RunDir, LogDir, RuntimeRoot}
+	// StateDir too: the slot assignments it records die with the owner's
+	// slot map below; a reinstall starts from "never wiped".
+	paths := []string{ConfigDir, RunDir, LogDir, RuntimeRoot, StateDir}
 	if cfg != nil && filepath.Base(filepath.Dir(cfg.BinaryPath)) == "clux-native" {
 		paths = append(paths, filepath.Dir(cfg.BinaryPath))
 	} else {
