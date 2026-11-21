@@ -11,9 +11,16 @@ import (
 	"testing"
 )
 
+// ownerProxy: `clux host start` (uid 501) listening on the proxy port.
+var ownerProxy = []Listener{
+	{IPv4: true, Addr: net.IPv4(127, 0, 0, 1), Port: 47821, UID: 501},
+	{IPv6: true, Addr: net.IPv6loopback, Port: 47821, UID: 501},
+}
+
 func TestPFRulesBaseShape(t *testing.T) {
-	r := PFRules([]int{432, 431}, 47821, nil)
+	r := PFRules([]int{432, 431}, 501, 47821, ownerProxy)
 	want := []string{
+		"block return in quick on lo0 proto tcp from any to any port 47821 user != 501",
 		"pass out quick on lo0 inet proto tcp from any to 127.0.0.1 port 47821 user 431 flags S/SA keep state",
 		"pass out quick on lo0 inet6 proto tcp from any to ::1 port 47821 user 431 flags S/SA keep state",
 		"pass out quick on lo0 inet proto tcp from any to 127.0.0.1 port 47821 user 432 flags S/SA keep state",
@@ -28,9 +35,95 @@ func TestPFRulesBaseShape(t *testing.T) {
 			t.Errorf("missing rule %q in:\n%s", w, r)
 		}
 	}
-	// Order matters (quick): every pass must come before the blocks.
-	if strings.LastIndex(r, "\npass ") > strings.Index(r, "\nblock ") {
+	// Order matters (quick): the inbound guards come first, then every
+	// pass, then the outbound blocks.
+	if strings.LastIndex(r, "\nblock return in ") > strings.Index(r, "\npass ") {
+		t.Fatalf("an inbound guard follows a pass rule:\n%s", r)
+	}
+	if strings.LastIndex(r, "\npass ") > strings.Index(r, "\nblock return out ") {
 		t.Fatalf("a pass rule follows the block rules:\n%s", r)
+	}
+}
+
+// Finding: a slot that binds the proxy port while `clux host start` is
+// down would receive the other workspaces' Proxy-Authorization. The slots
+// are only passed to the port while every listener on it is the owner's,
+// and the inbound guard refuses delivery to anyone else's listener there.
+func TestPFRulesProxyOnlyWhileOwnerListens(t *testing.T) {
+	const a, b, owner = 431, 432, 501
+	passed := func(r string) bool {
+		return strings.Contains(r, "pass out quick on lo0 inet proto tcp from any to 127.0.0.1 port 47821 user 431 ")
+	}
+	guard := "block return in quick on lo0 proto tcp from any to any port 47821 user != 501\n"
+	for name, c := range map[string]struct {
+		ls   []Listener
+		want bool
+	}{
+		"nobody listens":     {nil, false},
+		"owner listens":      {ownerProxy, true},
+		"owner v4 only":      {ownerProxy[:1], true},
+		"slot squats":        {[]Listener{{IPv4: true, Addr: net.IPv4(127, 0, 0, 1), Port: 47821, UID: b}}, false},
+		"slot squats ::1":    {append(ownerProxy[:1:1], Listener{IPv6: true, Addr: net.IPv6loopback, Port: 47821, UID: b}), false},
+		"slot wildcard":      {append(ownerProxy[:2:2], Listener{IPv4: true, Port: 47821, UID: a}), false},
+		"other owner's user": {[]Listener{{IPv4: true, Port: 47821, UID: 502}}, false},
+	} {
+		r := PFRules([]int{a, b}, owner, 47821, c.ls)
+		if passed(r) != c.want {
+			t.Errorf("%s: proxy passed=%v, want %v\n%s", name, passed(r), c.want, r)
+		}
+		if !strings.Contains(r, guard) {
+			t.Errorf("%s: no inbound guard on the proxy port\n%s", name, r)
+		}
+	}
+}
+
+// Finding: a port a slot released could be rebound by someone else while
+// its pass rule is still loaded. Every own port carries an inbound guard
+// naming the slot, so a connection is only delivered to that slot's
+// listener, whatever the last snapshot said.
+func TestPFRulesGuardOwnPorts(t *testing.T) {
+	const a, b = 431, 432
+	ls := append([]Listener{
+		{IPv4: true, IPv6: true, Port: 5173, UID: a},
+		{IPv4: true, Addr: net.IPv4(127, 0, 0, 1), Port: 3000, UID: a},
+		{IPv6: true, Addr: net.IPv6loopback, Port: 3000, UID: a},
+		{IPv4: true, Port: 4000, UID: b},
+	}, ownerProxy...)
+	r := PFRules([]int{a, b}, 501, 47821, ls)
+	for _, w := range []string{
+		"block return in quick on lo0 proto tcp from any to any port 3000 user != 431\n",
+		"block return in quick on lo0 proto tcp from any to any port 5173 user != 431\n",
+		"block return in quick on lo0 proto tcp from any to any port 4000 user != 432\n",
+	} {
+		if !strings.Contains(r, w) {
+			t.Errorf("missing %q in:\n%s", w, r)
+		}
+	}
+	if n := strings.Count(r, "port 3000 user != "); n != 1 {
+		t.Errorf("port 3000 guarded %d times (one per port, both families)", n)
+	}
+	// Every port that has a pass-out rule has a guard.
+	for _, line := range strings.Split(r, "\n") {
+		if !strings.HasPrefix(line, "pass out ") {
+			continue
+		}
+		f := strings.Fields(line)
+		var port, uid string
+		for i := range f {
+			if f[i] == "port" {
+				port = f[i+1]
+			}
+			if f[i] == "user" {
+				uid = f[i+1]
+			}
+		}
+		want := "port " + port + " user != " + uid
+		if port == "47821" {
+			want = "port 47821 user != 501"
+		}
+		if !strings.Contains(r, want+"\n") {
+			t.Errorf("pass rule without guard: %s", line)
+		}
 	}
 }
 
@@ -46,7 +139,7 @@ func TestPFRulesAgentListeners(t *testing.T) {
 		{IPv6: true, Addr: net.IPv6loopback, Port: 4000, UID: owner},          // ... but owner on ::1:4000
 		{IPv4: true, Addr: net.IPv4(127, 0, 0, 1), Port: 47821, UID: agent},   // proxy port is never "own"
 	}
-	r := PFRules([]int{agent}, 47821, ls)
+	r := PFRules([]int{agent}, 501, 47821, ls)
 	has := func(fam, dst string, port string) bool {
 		return strings.Contains(r, "pass out quick on lo0 "+fam+" proto tcp from any to "+dst+" port "+port+" user 431 ")
 	}
@@ -64,11 +157,13 @@ func TestPFRulesAgentListeners(t *testing.T) {
 			t.Errorf("port %s must stay blocked:\n%s", p, r)
 		}
 	}
-	if strings.Count(r, "port 47821 ") != 2 {
-		t.Errorf("proxy port duplicated:\n%s", r)
+	// The agent listens on the proxy port: never "own", and the proxy is
+	// not passed while it does (only the guard mentions the port).
+	if strings.Count(r, "port 47821 ") != 1 || !strings.Contains(r, "port 47821 user != 501\n") {
+		t.Errorf("proxy port with an agent listener on it:\n%s", r)
 	}
 	// Deterministic output, so the pf daemon only reloads on real changes.
-	if r != PFRules([]int{agent}, 47821, append([]Listener{ls[2], ls[0]}, ls[1:]...)) {
+	if r != PFRules([]int{agent}, 501, 47821, append([]Listener{ls[2], ls[0]}, ls[1:]...)) {
 		t.Error("output depends on listener order")
 	}
 }
@@ -81,7 +176,7 @@ func TestPFRulesSlotsAreSeparated(t *testing.T) {
 		{IPv4: true, Port: 4000, UID: b},
 		{IPv4: true, Port: 5000, UID: a}, {IPv4: true, Port: 5000, UID: b}, // shared port: nobody's
 	}
-	r := PFRules([]int{a, b}, 47821, ls)
+	r := PFRules([]int{a, b}, 501, 47821, ls)
 	for _, c := range []struct {
 		port string
 		uid  string
@@ -92,7 +187,7 @@ func TestPFRulesSlotsAreSeparated(t *testing.T) {
 			t.Errorf("port %s uid %s: pass=%v, want %v\n%s", c.port, c.uid, got, c.want, r)
 		}
 	}
-	if r != PFRules([]int{b, a}, 47821, ls) {
+	if r != PFRules([]int{b, a}, 501, 47821, ls) {
 		t.Error("output depends on uid order")
 	}
 }
@@ -102,8 +197,12 @@ func TestPFRulesCapsListenerRules(t *testing.T) {
 	for p := 10000; p < 11000; p++ {
 		ls = append(ls, Listener{IPv4: true, Port: p, UID: 431})
 	}
-	if n := strings.Count(PFRules([]int{431}, 47821, ls), "\npass out "); n > maxListenerRules+2 {
+	r := PFRules([]int{431}, 501, 47821, append(ls, ownerProxy...))
+	if n := strings.Count(r, "\npass out "); n > maxListenerRules+2 {
 		t.Fatalf("%d pass rules", n)
+	}
+	if n := strings.Count(r, "\nblock return in "); n > maxListenerRules+1 {
+		t.Fatalf("%d guard rules", n)
 	}
 }
 

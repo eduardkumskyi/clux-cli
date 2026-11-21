@@ -215,7 +215,7 @@ func Install(opts InstallOptions) error {
 	if err := writeFileSafe(ConfigPath, append(b, '\n'), 0o644, 0, 0); err != nil {
 		return err
 	}
-	if err := writeFileSafe(PFRulesPath, []byte(PFRules(cfg.AgentUIDs(), port, nil)), 0o644, 0, 0); err != nil {
+	if err := writeFileSafe(PFRulesPath, []byte(PFRules(cfg.AgentUIDs(), cfg.OwnerUID, port, nil)), 0o644, 0, 0); err != nil {
 		return err
 	}
 	step("config %s (egress proxy port %d), pf rules %s", ConfigPath, port, PFRulesPath)

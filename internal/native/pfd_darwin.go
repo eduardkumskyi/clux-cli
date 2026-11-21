@@ -44,7 +44,7 @@ func RunPFD(ctx context.Context, logf func(string, ...any)) error {
 	}
 	d := &pfd{cfg: cfg, uids: cfg.AgentUIDs(), logf: logf, pf: execPfctl}
 	d.verifyMain()
-	base := PFRules(d.uids, cfg.ProxyPort, nil)
+	base := PFRules(d.uids, cfg.OwnerUID, cfg.ProxyPort, nil)
 	d.load(base, true)
 	d.enable()
 	logf("pf daemon running (agent uids %v, proxy port %d)", d.uids, cfg.ProxyPort)
@@ -71,7 +71,8 @@ func RunPFD(ctx context.Context, logf func(string, ...any)) error {
 			v4, v6 := agentLoopbackPorts(u, cfg.ProxyPort, ls)
 			d.ports += len(v4) + len(v6)
 		}
-		d.load(PFRules(d.uids, cfg.ProxyPort, ls), false)
+		d.proxyUp = ownerOnlyListens(cfg.OwnerUID, cfg.ProxyPort, ls)
+		d.load(PFRules(d.uids, cfg.OwnerUID, cfg.ProxyPort, ls), false)
 		if tick%10 == 9 && !d.isEnabled() {
 			logf("pf was disabled by something else; enabling it again")
 			d.enable()
@@ -114,6 +115,7 @@ type pfd struct {
 	mainAnchor bool   // main ruleset evaluates com.apple/*
 	enabled    bool
 	ports      int
+	proxyUp    bool // the proxy pass rules are in (owner listens on the port)
 	lastErr    string
 }
 
@@ -217,7 +219,7 @@ func (d *pfd) isEnabled() bool {
 func (d *pfd) status() PFStatus {
 	return PFStatus{
 		Enabled: d.enabled, RulesLoaded: d.loaded, MainAnchor: d.mainAnchor, Anchor: PFAnchor,
-		UIDs: d.uids, ListenerPorts: d.ports, Updated: time.Now().UTC().Format(time.RFC3339), Error: d.lastErr,
+		UIDs: d.uids, ListenerPorts: d.ports, ProxyPassed: d.proxyUp, Updated: time.Now().UTC().Format(time.RFC3339), Error: d.lastErr,
 	}
 }
 

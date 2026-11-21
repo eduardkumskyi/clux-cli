@@ -62,7 +62,7 @@ func newTestPFD(f *fakePF) (*pfd, *[]PFStatus) {
 func TestPFDReloadsAFlushedAnchor(t *testing.T) {
 	f := &fakePF{mainAnchor: true}
 	d, published := newTestPFD(f)
-	rules := PFRules(d.uids, 47821, nil)
+	rules := PFRules(d.uids, 501, 47821, nil)
 	d.verifyMain()
 	d.load(rules, true)
 	if !d.loaded || f.anchor != rules {
@@ -96,7 +96,7 @@ func TestPFDReloadsAFlushedAnchor(t *testing.T) {
 func TestPFDRestoresMainRulesetAnchorPoint(t *testing.T) {
 	f := &fakePF{mainAnchor: false}
 	d, _ := newTestPFD(f)
-	d.load(PFRules(d.uids, 47821, nil), true)
+	d.load(PFRules(d.uids, 501, 47821, nil), true)
 	d.verify()
 	if !f.mainAnchor || !d.mainAnchor {
 		t.Fatal("/etc/pf.conf not reloaded when the main ruleset lacked com.apple/*")
@@ -110,7 +110,7 @@ func TestPFDStatusNotLoadedWhileRepairFails(t *testing.T) {
 	f := &fakePF{mainAnchor: true}
 	d, published := newTestPFD(f)
 	d.verifyMain()
-	d.load(PFRules(d.uids, 47821, nil), true)
+	d.load(PFRules(d.uids, 501, 47821, nil), true)
 	f.anchor = ""
 	f.failLoad = true
 	d.verify()

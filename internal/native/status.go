@@ -19,8 +19,11 @@ type PFStatus struct {
 	Anchor        string `json:"anchor"`
 	UIDs          []int  `json:"uids"`
 	ListenerPorts int    `json:"listener_ports"`
-	Updated       string `json:"updated"`
-	Error         string `json:"error,omitempty"`
+	// ProxyPassed: the slots may reach the egress proxy port (only while
+	// every listener on it is the owner's, i.e. `clux host start` runs).
+	ProxyPassed bool   `json:"proxy_passed"`
+	Updated     string `json:"updated"`
+	Error       string `json:"error,omitempty"`
 }
 
 // pfStatusStale: the daemon rewrites the file every few seconds; an older
