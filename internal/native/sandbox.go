@@ -154,6 +154,13 @@ func SandboxProfile(p ProfileParams) (string, error) {
 (allow network-outbound (remote ip "localhost:*"))
 `)
 	fmt.Fprintf(&b, "(allow network-outbound (remote unix-socket (subpath %s)))\n", q(p.WorkspaceDir))
+	b.WriteString(`
+;; no system resolver: pf can't confine DNS sent by mDNSResponder (root) on
+;; the agent's behalf, so sandboxed tools must not reach it at all; they
+;; resolve nothing themselves (the egress proxy does)
+(deny mach-lookup (global-name "com.apple.dnssd.service"))
+(deny network-outbound (literal "/private/var/run/mDNSResponder"))
+`)
 
 	b.WriteString("\n;; no git hooks: a hook planted in a repo would run on the next git command\n")
 	fmt.Fprintf(&b, "(deny file-write* (regex #\"^%s/(.*/)?\\.git/hooks(/|$)\"))\n", regexp.QuoteMeta(p.WorkspaceDir))

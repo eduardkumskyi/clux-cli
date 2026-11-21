@@ -13,9 +13,17 @@ var errMacOnly = errors.New("the native runtime is only available on macOS")
 // InstallOptions configures Install (macOS only).
 type InstallOptions struct {
 	Owner      string
+	Slots      int
 	CLIVersion string
 	Out        io.Writer
 }
+
+// OwnerSlotMapFile is where `clux host start` keeps the workspace -> slot
+// assignments, relative to the owner's home.
+const OwnerSlotMapFile = ".clux/native-slots.json"
+
+// KillUID is macOS-only.
+func KillUID(uid, except int) int { return 0 }
 
 // UninstallOptions configures Uninstall (macOS only).
 type UninstallOptions struct {

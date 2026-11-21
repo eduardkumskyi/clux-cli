@@ -97,7 +97,7 @@ commands:
   doctor                                      check local environment (docker, config, connectivity)
   host start [--interval <duration>] [--no-native-prompt]
                                               connect and keep this host registered (foreground)
-  native install [--owner <user>]             (macOS, root) set up the native runtime for iOS/Xcode workspaces
+  native install [--owner <user>] [--slots N] (macOS, root) set up the native runtime for iOS/Xcode workspaces
   native uninstall [--purge]                  (macOS, root) remove the native runtime
   native status                               show the native runtime's state
   version                                     print the CLI version`)

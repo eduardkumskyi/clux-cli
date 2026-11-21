@@ -116,15 +116,19 @@ func runHostStart(args []string) error {
 	newNativeOffer(cfg, *noNativePrompt, log.Printf).run()
 
 	h := newHostLoop(cfg, *interval, logger)
+	h.caps = &native.Capabilities{Supervisor: func(ctx context.Context) (string, string, error) {
+		ncfg, err := native.LoadConfig()
+		if err != nil {
+			return "", "", err
+		}
+		return supervisorsSummary(slotsStatus(ctx, ncfg))
+	}}
 	if nh := setupNative(ctx, cfg, stateDir); nh != nil {
 		h.proxy = nh.proxy
 		h.opts.Runtimes = map[string]hostsession.Runtime{hostsession.RuntimeNativeMacOS: nh.runtime}
 		h.opts.Egress = nh.proxy
+		h.caps.FreeSlots = nh.runtime.Slots.Free
 	}
-	h.caps = &native.Capabilities{Supervisor: func(ctx context.Context) (string, string, error) {
-		r, err := supervisorStatus(ctx)
-		return r.Version, r.Sandbox, err
-	}}
 	go h.dispatch(ctx, netwatch.Watch(ctx, netwatch.Options{}))
 	err = h.run(ctx)
 	if err != nil && tunnel.IsFatal(err) {

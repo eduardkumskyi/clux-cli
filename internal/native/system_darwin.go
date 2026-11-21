@@ -96,24 +96,6 @@ next:
 	return 0, fmt.Errorf("no free uid/gid in %d-%d", idRangeLo, idRangeHi)
 }
 
-// ensureDir creates path (and parents) and enforces mode/ownership on it.
-func ensureDir(path string, mode os.FileMode, uid, gid int) error {
-	if err := os.MkdirAll(path, mode); err != nil {
-		return err
-	}
-	if err := os.Chown(path, uid, gid); err != nil {
-		return err
-	}
-	return os.Chmod(path, mode)
-}
-
-func writeOwned(path string, data []byte, mode os.FileMode, uid, gid int) error {
-	if err := writeFileAtomic(path, data, mode); err != nil {
-		return err
-	}
-	return os.Chown(path, uid, gid)
-}
-
 // safeChain reports whether every existing directory from dir up to / is
 // root-owned and not group/world writable: a root daemon must not run a
 // binary that someone else could swap.
@@ -164,29 +146,58 @@ func pickProxyPort() (int, error) {
 	return 0, fmt.Errorf("no free port for the egress proxy near %d", DefaultProxyPort)
 }
 
-func copyFile(src, dst string, mode os.FileMode) error {
-	data, err := os.ReadFile(src)
-	if err != nil {
-		return err
-	}
-	return writeFileAtomic(dst, data, mode)
-}
+// killUser kills every process of uid (as root: uninstall, slot removal).
+func killUser(uid int) { KillUID(uid, -1) }
 
-// killUser SIGKILLs every process of uid (repeated: processes can fork
-// while we iterate).
-func killUser(uid int) {
-	for i := 0; i < 5; i++ {
-		procs, err := unix.SysctlKinfoProcSlice("kern.proc.uid", uid)
-		if err != nil || len(procs) == 0 {
-			return
-		}
-		for _, p := range procs {
-			if pid := int(p.Proc.P_pid); pid > 1 {
-				_ = syscall.Kill(pid, syscall.SIGKILL)
+// KillUID kills every process whose real or effective uid is uid, except
+// pid except (a supervisor clearing its own slot passes its pid). Each round
+// first stops everything it sees, then kills it, so a process can't escape
+// by forking faster than the sweep; rounds repeat until nothing is left.
+// Returns how many processes were signalled.
+func KillUID(uid, except int) int {
+	list := func() []int {
+		seen := map[int]bool{}
+		var pids []int
+		for _, name := range []string{"kern.proc.uid", "kern.proc.ruid"} {
+			procs, err := unix.SysctlKinfoProcSlice(name, uid)
+			if err != nil {
+				continue
+			}
+			for _, p := range procs {
+				if pid := int(p.Proc.P_pid); !seen[pid] {
+					seen[pid] = true
+					pids = append(pids, pid)
+				}
 			}
 		}
-		time.Sleep(300 * time.Millisecond)
+		return pids
 	}
+	return killAll(list, syscall.Kill, except, 10, 100*time.Millisecond)
+}
+
+func killAll(list func() []int, kill func(int, syscall.Signal) error, except, rounds int, pause time.Duration) int {
+	total := 0
+	for i := 0; i < rounds; i++ {
+		var pids []int
+		for _, pid := range list() {
+			if pid > 1 && pid != except {
+				pids = append(pids, pid)
+			}
+		}
+		if len(pids) == 0 {
+			return total
+		}
+		for _, pid := range pids {
+			_ = kill(pid, syscall.SIGSTOP)
+		}
+		for _, pid := range pids {
+			if kill(pid, syscall.SIGKILL) == nil {
+				total++
+			}
+		}
+		time.Sleep(pause)
+	}
+	return total
 }
 
 func launchdLoaded(label string) (bool, string) {

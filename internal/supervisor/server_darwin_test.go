@@ -4,6 +4,7 @@ package supervisor
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net"
 	"os"
@@ -89,6 +90,11 @@ func fakeRuntime(t *testing.T, root string) *RuntimeSpec {
 
 func testServer(t *testing.T, ownerUID int) (*Server, string) {
 	t.Helper()
+	return testServerWith(t, ownerUID, nil)
+}
+
+func testServerWith(t *testing.T, ownerUID int, mut func(*Options)) (*Server, string) {
+	t.Helper()
 	// Short socket path: sun_path is limited to 104 bytes.
 	tmp, err := os.MkdirTemp("/tmp", "cluxsv")
 	if err != nil {
@@ -100,13 +106,22 @@ func testServer(t *testing.T, ownerUID int) (*Server, string) {
 	rt := filepath.Join(tmp, "rt")
 	os.MkdirAll(filepath.Join(home, "Library"), 0o700)
 	os.MkdirAll(rt, 0o755)
-	cfg := &native.Config{Version: 1, OwnerUID: ownerUID, AgentUser: native.AgentUser, AgentUID: 431, ProxyPort: 47821, BinaryPath: "/x"}
-	s, err := NewServer(Options{
-		Config: cfg, Version: "test", Socket: filepath.Join(tmp, "s.sock"),
-		AgentHome: home, RuntimeRoot: rt, SkipUIDCheck: true, Logf: t.Logf,
-		// Never touch the developer's real simulators from tests.
+	cfg := &native.Config{Version: 2, OwnerUID: ownerUID, Slots: []native.Slot{{N: 1, User: "_clux1", UID: 431, GID: 431}},
+		SlotsGID: 433, CtlGID: 432, ProxyPort: 47821, BinaryPath: "/x"}
+	mapping := filepath.Join(tmp, "mapping.plist")
+	os.WriteFile(mapping, []byte("<?xml version=\"1.0\"?><plist/>"), 0o644)
+	opts := Options{
+		Config: cfg, Slot: 1, Version: "test", Socket: filepath.Join(tmp, "s.sock"),
+		AgentHome: home, RuntimeRoot: rt, SimMapping: mapping, SkipUIDCheck: true, Logf: t.Logf,
+		// Never touch the developer's real simulators or processes from tests.
 		ShutdownSimulators: func(context.Context) error { return nil },
-	})
+		KillSlot:           func() int { return 0 },
+		PFCheck:            func() error { return nil },
+	}
+	if mut != nil {
+		mut(&opts)
+	}
+	s, err := NewServer(opts)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -234,41 +249,99 @@ func TestProcArgsLive(t *testing.T) {
 	}
 }
 
-func TestStopShutsDownSimulatorsOnlyWhenIdle(t *testing.T) {
-	s, rt := testServer(t, os.Getuid())
-	var shutdowns atomic.Int32
-	s.opts.ShutdownSimulators = func(context.Context) error { shutdowns.Add(1); return nil }
+// Stop and delete end everything the slot uid runs: simulators first
+// (gracefully), then every remaining process (apps the agent built, which
+// run outside the sandbox and may have hidden their environment).
+func TestStopAndDeleteClearTheWholeSlot(t *testing.T) {
+	var order []string
+	var kills atomic.Int32
+	s, rt := testServerWith(t, os.Getuid(), func(o *Options) {
+		o.ShutdownSimulators = func(context.Context) error { order = append(order, "simctl"); return nil }
+		o.KillSlot = func() int { kills.Add(1); order = append(order, "kill"); return 0 }
+	})
 	c := &Client{Socket: s.opts.Socket}
 	ctx := context.Background()
-	runtime := fakeRuntime(t, rt)
-	for _, id := range []string{"21", "22"} {
-		if _, err := c.Call(ctx, Request{
-			Op: OpStart, WorkspaceID: id, HMACSecret: "s",
-			ProxyURL: "http://ws-" + id + ":pw@127.0.0.1:47821", Runtime: runtime,
-		}); err != nil {
-			t.Fatalf("start %s: %v", id, err)
-		}
+	start := Request{Op: OpStart, WorkspaceID: "21", HMACSecret: "s", ProxyURL: "http://ws-21:pw@127.0.0.1:47821", Runtime: fakeRuntime(t, rt)}
+	if _, err := c.Call(ctx, start); err != nil {
+		t.Fatalf("start: %v", err)
 	}
-	// Another workspace still runs: its simulators must stay up.
+	if kills.Load() != 1 {
+		t.Fatal("start must clear leftovers of the slot before spawning")
+	}
+	order = nil
 	if _, err := c.Call(ctx, Request{Op: OpStop, WorkspaceID: "21"}); err != nil {
 		t.Fatal(err)
 	}
-	if n := shutdowns.Load(); n != 0 {
-		t.Fatalf("simulators shut down while workspace 22 still runs (%d)", n)
+	if strings.Join(order, ",") != "simctl,kill" {
+		t.Fatalf("stop: %v, want simctl then kill", order)
 	}
-	// Last running workspace stops: booted devices (and the agent-built
-	// apps in them) must not outlive it.
-	if _, err := c.Call(ctx, Request{Op: OpStop, WorkspaceID: "22"}); err != nil {
-		t.Fatal(err)
-	}
-	if n := shutdowns.Load(); n != 1 {
-		t.Fatalf("want 1 simulator shutdown after the last stop, got %d", n)
-	}
+	// Leave state behind that a later workspace in this slot must not see.
+	lib := filepath.Join(s.opts.AgentHome, "Library")
+	os.MkdirAll(filepath.Join(lib, "Developer", "CoreSimulator", "Devices", "X"), 0o700)
+	os.WriteFile(filepath.Join(lib, "Keychains-login"), []byte("secret"), 0o600)
+	order = nil
 	if _, err := c.Call(ctx, Request{Op: OpDelete, WorkspaceID: "21"}); err != nil {
 		t.Fatal(err)
 	}
-	if n := shutdowns.Load(); n != 2 {
-		t.Fatalf("want a shutdown on delete with nothing running, got %d", n)
+	if strings.Join(order, ",") != "simctl,kill" {
+		t.Fatalf("delete: %v", order)
 	}
-	c.Call(ctx, Request{Op: OpDelete, WorkspaceID: "22"})
+	for _, gone := range []string{"Developer/CoreSimulator", "Keychains-login"} {
+		if _, err := os.Stat(filepath.Join(lib, gone)); !os.IsNotExist(err) {
+			t.Errorf("delete kept Library/%s", gone)
+		}
+	}
+	mapping := filepath.Join(lib, "Developer", "Xcode", "SDKToSimulatorIndexMapping.plist")
+	if _, err := os.Stat(mapping); err != nil {
+		t.Errorf("home skeleton not restored after the wipe: %v", err)
+	}
+	if st, _ := c.Call(ctx, Request{Op: OpStatus}); len(st.Resident) != 0 || st.Slot != 1 {
+		t.Fatalf("status after delete: %+v", st)
+	}
+}
+
+func TestSlotServesOneWorkspace(t *testing.T) {
+	s, rt := testServer(t, os.Getuid())
+	ctx := context.Background()
+	r := fakeRuntime(t, rt)
+	req := func(id string) Request {
+		return Request{Op: OpStart, WorkspaceID: id, HMACSecret: "s", ProxyURL: "http://ws-" + id + ":pw@127.0.0.1:47821", Runtime: r}
+	}
+	if resp := s.Dispatch(ctx, req("31")); !resp.OK {
+		t.Fatalf("start 31: %s", resp.Error)
+	}
+	defer s.Dispatch(ctx, Request{Op: OpDelete, WorkspaceID: "31"})
+	resp := s.Dispatch(ctx, req("32"))
+	if resp.OK || !strings.Contains(resp.Error, "already holds workspace 31") {
+		t.Fatalf("second workspace in one slot: %+v", resp)
+	}
+	if st := s.Dispatch(ctx, Request{Op: OpStatus}); len(st.Resident) != 1 || st.Resident[0] != "31" {
+		t.Fatalf("resident %v", st.Resident)
+	}
+}
+
+func TestStartRefusedWithoutPF(t *testing.T) {
+	s, rt := testServerWith(t, os.Getuid(), func(o *Options) {
+		o.PFCheck = func() error { return errors.New("pf firewall not active") }
+	})
+	resp := s.Dispatch(context.Background(), Request{
+		Op: OpStart, WorkspaceID: "41", HMACSecret: "s", ProxyURL: "http://ws-41:pw@127.0.0.1:47821", Runtime: fakeRuntime(t, rt),
+	})
+	if resp.OK || !strings.Contains(resp.Error, "pf firewall not active") {
+		t.Fatalf("started without pf: %+v", resp)
+	}
+	if _, err := os.Stat(filepath.Join(s.workspacesDir(), "41")); !os.IsNotExist(err) {
+		t.Fatal("workspace dir created although the start was refused")
+	}
+}
+
+func TestClientChecksServerUID(t *testing.T) {
+	s, _ := testServer(t, os.Getuid())
+	if _, err := (&Client{Socket: s.opts.Socket, ServerUID: os.Getuid()}).Call(context.Background(), Request{Op: OpStatus}); err != nil {
+		t.Fatalf("right server uid rejected: %v", err)
+	}
+	_, err := (&Client{Socket: s.opts.Socket, ServerUID: os.Getuid() + 1}).Call(context.Background(), Request{Op: OpStatus})
+	if err == nil || !strings.Contains(err.Error(), "refusing to use it") {
+		t.Fatalf("socket served by another uid accepted: %v", err)
+	}
 }

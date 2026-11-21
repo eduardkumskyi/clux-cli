@@ -17,8 +17,11 @@ const xcodeTTL = 10 * time.Minute
 
 // Capabilities builds the register/heartbeat "capabilities" object.
 type Capabilities struct {
-	// Supervisor reports the supervisor's version and sandbox state.
+	// Supervisor reports the slot supervisors' version and sandbox state
+	// (err only when none answers).
 	Supervisor func(ctx context.Context) (version, sandbox string, err error)
+	// FreeSlots reports how many slots no workspace holds (nil: all free).
+	FreeSlots func() int
 
 	loadConfig func() (*Config, error)
 	pfStatus   func() (PFStatus, error)
@@ -71,14 +74,30 @@ func (c *Capabilities) Collect(ctx context.Context) map[string]any {
 		pf = "active"
 	}
 	xc, rts := c.xcodeInfo(ctx, now())
+	total := len(cfg.Slots)
+	free := total
+	if c.FreeSlots != nil {
+		free = c.FreeSlots()
+	}
+	agentUser := ""
+	if total > 0 {
+		agentUser = cfg.Slots[0].User
+		if total > 1 {
+			agentUser += ".." + cfg.Slots[total-1].User
+		}
+	}
 	caps["native_macos"] = map[string]any{
 		"installed":          true,
-		"agent_user":         cfg.AgentUser,
+		"agent_user":         agentUser,
 		"xcode_version":      xc,
 		"simulator_runtimes": rts,
 		"sandbox":            sandbox,
 		"pf":                 pf,
 		"supervisor_version": version,
+		// Each native workspace holds one slot (agent user) while it
+		// exists; with none free, workspace.start fails.
+		"slots_total": total,
+		"slots_free":  free,
 	}
 	if supOK && pf == "active" {
 		caps["runtimes"] = []string{"docker", "native_macos"}

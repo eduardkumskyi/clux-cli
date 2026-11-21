@@ -54,10 +54,19 @@ func TestParseDSAttr(t *testing.T) {
 
 func TestPFStatusActive(t *testing.T) {
 	now := time.Now()
-	st := PFStatus{Enabled: true, RulesLoaded: true, Updated: now.Add(-5 * time.Second).UTC().Format(time.RFC3339)}
+	st := PFStatus{Enabled: true, RulesLoaded: true, MainAnchor: true, UIDs: []int{431},
+		Updated: now.Add(-5 * time.Second).UTC().Format(time.RFC3339)}
 	if !st.Active(now) {
 		t.Fatal("fresh status inactive")
 	}
+	if !st.Covers(431) || st.Covers(432) {
+		t.Fatal("Covers")
+	}
+	st.MainAnchor = false
+	if st.Active(now) {
+		t.Fatal("anchor not evaluated by the main ruleset, but reported active")
+	}
+	st.MainAnchor = true
 	if st.Active(now.Add(time.Minute)) {
 		t.Fatal("stale status (daemon dead) reported active")
 	}
@@ -79,9 +88,12 @@ func TestCapabilities(t *testing.T) {
 	probes := 0
 	c := &Capabilities{
 		Supervisor: func(context.Context) (string, string, error) { return "0.4.0", "active", nil },
-		loadConfig: func() (*Config, error) { return &Config{AgentUser: AgentUser}, nil },
+		loadConfig: func() (*Config, error) {
+			return &Config{Slots: []Slot{{N: 1, User: "_clux1"}, {N: 2, User: "_clux2"}, {N: 3, User: "_clux3"}}}, nil
+		},
+		FreeSlots: func() int { return 1 },
 		pfStatus: func() (PFStatus, error) {
-			return PFStatus{Enabled: true, RulesLoaded: true, Updated: now.UTC().Format(time.RFC3339)}, nil
+			return PFStatus{Enabled: true, RulesLoaded: true, MainAnchor: true, Updated: now.UTC().Format(time.RFC3339)}, nil
 		},
 		xcodeProbe: func(context.Context) (string, []string) { probes++; return "16.4", []string{"iOS 18.6"} },
 		now:        func() time.Time { return now },
@@ -90,9 +102,9 @@ func TestCapabilities(t *testing.T) {
 	want := map[string]any{
 		"runtimes": []string{"docker", "native_macos"},
 		"native_macos": map[string]any{
-			"installed": true, "agent_user": "_clux", "xcode_version": "16.4",
+			"installed": true, "agent_user": "_clux1.._clux3", "xcode_version": "16.4",
 			"simulator_runtimes": []string{"iOS 18.6"}, "sandbox": "active", "pf": "active",
-			"supervisor_version": "0.4.0",
+			"supervisor_version": "0.4.0", "slots_total": 3, "slots_free": 1,
 		},
 	}
 	if !reflect.DeepEqual(got, want) {

@@ -12,6 +12,7 @@ import (
 // Options configures a supervisor (macOS only).
 type Options struct {
 	Config       *native.Config
+	Slot         int
 	Version      string
 	Socket       string
 	AgentHome    string

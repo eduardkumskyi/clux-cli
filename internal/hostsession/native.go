@@ -11,7 +11,7 @@ import (
 )
 
 // SupervisorCaller is the slice of supervisor.Client the native runtime
-// uses (an interface so tests can fake the agent-user daemon).
+// uses (an interface so tests can fake the agent-user daemons).
 type SupervisorCaller interface {
 	Call(ctx context.Context, req supervisor.Request) (supervisor.Response, error)
 }
@@ -22,12 +22,15 @@ type RuntimeInstaller interface {
 	Ensure(ctx context.Context, b sidecarrt.Bundle, inUse []string) (sidecarrt.Runtime, error)
 }
 
-// NativeRuntime runs a workspace as the agent user via the native
-// supervisor (`clux native supervise`). The owner side does what needs the
-// owner's rights: installing the sidecar runtime (needs the host PAT) and
-// the egress proxy the workspace's traffic is forced through.
+// NativeRuntime runs each workspace as its own agent user ("slot", see
+// internal/native) via that slot's supervisor (`clux native supervise
+// --slot n`). The owner side does what needs the owner's rights: assigning
+// slots, installing the sidecar runtime (needs the host PAT) and the
+// egress proxy the workspace's traffic is forced through.
 type NativeRuntime struct {
-	Supervisor SupervisorCaller
+	// Supervisor returns slot n's supervisor client.
+	Supervisor func(slot int) SupervisorCaller
+	Slots      *SlotMap
 	Installer  RuntimeInstaller
 	Egress     *egress.Proxy
 	ProxyPort  int
@@ -48,6 +51,24 @@ func (n *NativeRuntime) Start(ctx context.Context, frame map[string]any) (map[st
 	if secret == "" {
 		return nil, errors.New("hmac_secret is required")
 	}
+	slot, err := n.Slots.Assign(id, func(slot int) bool {
+		// A slot is only handed out if its supervisor answers and no other
+		// workspace's files are in it (e.g. the assignments file was lost).
+		st, err := n.Supervisor(slot).Call(ctx, supervisor.Request{Op: supervisor.OpStatus})
+		if err != nil {
+			return false
+		}
+		for _, r := range st.Resident {
+			if r != id {
+				return false
+			}
+		}
+		return true
+	})
+	if err != nil {
+		return nil, err
+	}
+	sup := n.Supervisor(slot)
 	// The policy is in place before the sidecar exists, so its very first
 	// request is already checked. A start without "egress" keeps what the
 	// proxy remembers for the workspace (else: empty allow list).
@@ -58,19 +79,11 @@ func (n *NativeRuntime) Start(ctx context.Context, frame map[string]any) (map[st
 	if err := n.Egress.SetPolicy(id, pol); err != nil {
 		return nil, err
 	}
-	var inUse []string
-	if st, err := n.Supervisor.Call(ctx, supervisor.Request{Op: supervisor.OpStatus}); err == nil {
-		for _, w := range st.Workspaces {
-			if w.Running {
-				inUse = append(inUse, w.RuntimeVersion)
-			}
-		}
-	}
-	rt, err := n.Installer.Ensure(ctx, bundle, inUse)
+	rt, err := n.Installer.Ensure(ctx, bundle, n.runtimesInUse(ctx))
 	if err != nil {
 		return nil, err
 	}
-	resp, err := n.Supervisor.Call(ctx, supervisor.Request{
+	resp, err := sup.Call(ctx, supervisor.Request{
 		Op:             supervisor.OpStart,
 		WorkspaceID:    id,
 		HMACSecret:     secret,
@@ -81,33 +94,64 @@ func (n *NativeRuntime) Start(ctx context.Context, frame map[string]any) (map[st
 		},
 	})
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("native slot %d: %w", slot, err)
 	}
 	return map[string]any{"sidecar_port": resp.SidecarPort}, nil
 }
 
-// Stop implements Runtime. The egress policy is kept for the next start.
+// runtimesInUse lists the runtime versions running sidecars use (kept by
+// the installer's pruning).
+func (n *NativeRuntime) runtimesInUse(ctx context.Context) []string {
+	var inUse []string
+	for slot := 1; slot <= n.Slots.Total(); slot++ {
+		st, err := n.Supervisor(slot).Call(ctx, supervisor.Request{Op: supervisor.OpStatus})
+		if err != nil {
+			continue
+		}
+		for _, w := range st.Workspaces {
+			if w.Running {
+				inUse = append(inUse, w.RuntimeVersion)
+			}
+		}
+	}
+	return inUse
+}
+
+// Stop implements Runtime. The egress policy and the slot are kept for the
+// next start; a workspace that never got a slot has nothing to stop.
 func (n *NativeRuntime) Stop(ctx context.Context, frame map[string]any) error {
 	id, err := n.id(frame)
 	if err != nil {
 		return err
 	}
-	_, err = n.Supervisor.Call(ctx, supervisor.Request{Op: supervisor.OpStop, WorkspaceID: id})
+	slot, ok := n.Slots.Lookup(id)
+	if !ok {
+		return nil
+	}
+	_, err = n.Supervisor(slot).Call(ctx, supervisor.Request{Op: supervisor.OpStop, WorkspaceID: id})
 	return err
 }
 
-// Delete implements Runtime.
+// Delete implements Runtime: the slot is wiped by its supervisor, then
+// freed for another workspace.
 func (n *NativeRuntime) Delete(ctx context.Context, frame map[string]any) (map[string]any, error) {
 	id, err := n.id(frame)
 	if err != nil {
 		return nil, err
 	}
-	resp, err := n.Supervisor.Call(ctx, supervisor.Request{Op: supervisor.OpDelete, WorkspaceID: id})
-	if err != nil {
-		return nil, err
+	var freed int64
+	if slot, ok := n.Slots.Lookup(id); ok {
+		resp, err := n.Supervisor(slot).Call(ctx, supervisor.Request{Op: supervisor.OpDelete, WorkspaceID: id})
+		if err != nil {
+			return nil, err
+		}
+		freed = resp.FreedBytes
+		if err := n.Slots.Release(id); err != nil {
+			return nil, err
+		}
 	}
 	n.Egress.Forget(id)
-	return map[string]any{"freed_storage_gb": int(resp.FreedBytes >> 30)}, nil
+	return map[string]any{"freed_storage_gb": int(freed >> 30)}, nil
 }
 
 // Status implements Runtime.
@@ -116,7 +160,11 @@ func (n *NativeRuntime) Status(ctx context.Context, frame map[string]any) (map[s
 	if err != nil {
 		return nil, err
 	}
-	st, err := n.Supervisor.Call(ctx, supervisor.Request{Op: supervisor.OpStatus})
+	slot, ok := n.Slots.Lookup(id)
+	if !ok {
+		return map[string]any{"running": false}, nil
+	}
+	st, err := n.Supervisor(slot).Call(ctx, supervisor.Request{Op: supervisor.OpStatus})
 	if err != nil {
 		return nil, err
 	}

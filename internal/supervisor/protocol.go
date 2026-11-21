@@ -2,12 +2,16 @@
 // that owns native workspace processes, and the client `clux host start`
 // uses to drive it.
 //
+// There is one supervisor per slot (agent user _cluxN), each serving at
+// most one workspace.
+//
 // Protocol: one JSON request line, one JSON response line per connection on
-// a unix socket (/private/var/run/clux-native/supervisor.sock, _clux:_cluxctl
-// 0660). The socket mode keeps everyone but the owner out at the
-// filesystem level; the supervisor additionally checks the peer's uid
-// (LOCAL_PEERCRED) against the configured owner, so a process that merely
-// has the group can't drive it either.
+// a unix socket (/private/var/run/clux-native/slots/<n>/supervisor.sock in
+// a _cluxN:_cluxctl 0750 directory, socket 0660). The socket mode keeps
+// everyone but the owner out at the filesystem level; the supervisor
+// additionally checks the peer's uid (LOCAL_PEERCRED) against the
+// configured owner, so a process that merely has the group can't drive it
+// either, and the owner's client checks the server is the slot's uid.
 package supervisor
 
 import (
@@ -66,6 +70,10 @@ type Response struct {
 	Version     string            `json:"version,omitempty"`
 	Sandbox     string            `json:"sandbox,omitempty"`
 	Workspaces  []WorkspaceStatus `json:"workspaces,omitempty"`
+	// Slot is the slot the answering supervisor serves; Resident lists the
+	// workspaces whose files are in it (running or not).
+	Slot     int      `json:"slot,omitempty"`
+	Resident []string `json:"resident,omitempty"`
 }
 
 // WorkspaceStatus describes one workspace the supervisor knows about.
@@ -80,6 +88,10 @@ type WorkspaceStatus struct {
 // Client talks to a supervisor socket.
 type Client struct {
 	Socket string
+	// ServerUID, if > 0, is the uid the supervisor must run as (the slot
+	// user): checked with LOCAL_PEERCRED before anything is sent, so a
+	// socket planted by someone else never receives a workspace's secrets.
+	ServerUID int
 }
 
 // Call sends req and waits for the reply (bounded by ctx). A reply with
@@ -98,6 +110,15 @@ func (c *Client) Call(ctx context.Context, req Request) (Response, error) {
 	}
 	stop := context.AfterFunc(ctx, func() { _ = conn.SetDeadline(time.Now()) })
 	defer stop()
+	if c.ServerUID > 0 {
+		uid, err := connPeerUID(conn)
+		if err != nil {
+			return Response{}, fmt.Errorf("native supervisor: checking its identity: %w", err)
+		}
+		if uid != c.ServerUID {
+			return Response{}, fmt.Errorf("native supervisor socket %s is served by uid %d, not the slot user (uid %d); refusing to use it", c.Socket, uid, c.ServerUID)
+		}
+	}
 
 	b, err := json.Marshal(req)
 	if err != nil {

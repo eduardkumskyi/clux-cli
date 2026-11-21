@@ -32,21 +32,30 @@ func runNative(args []string) error {
 	case "install":
 		fs := flag.NewFlagSet("native install", flag.ExitOnError)
 		owner := fs.String("owner", "", "account that runs `clux host start` (default: the user who ran sudo)")
+		slots := fs.Int("slots", 0, fmt.Sprintf("number of agent users = native workspaces that can exist at once (1-%d; default: keep the installed count, %d at first)", native.MaxSlots, native.DefaultSlots))
 		if err := fs.Parse(args[1:]); err != nil {
 			return err
 		}
-		return native.Install(native.InstallOptions{Owner: *owner, CLIVersion: version, Out: os.Stdout})
+		if *slots < 0 || *slots > native.MaxSlots {
+			return fmt.Errorf("--slots must be 1-%d", native.MaxSlots)
+		}
+		return native.Install(native.InstallOptions{Owner: *owner, Slots: *slots, CLIVersion: version, Out: os.Stdout})
 	case "uninstall":
 		fs := flag.NewFlagSet("native uninstall", flag.ExitOnError)
-		purge := fs.Bool("purge", false, "also delete workspace files and simulators in "+native.AgentHome)
+		purge := fs.Bool("purge", false, "also delete workspace files and simulators in "+native.SlotsDir)
 		if err := fs.Parse(args[1:]); err != nil {
 			return err
 		}
 		return native.Uninstall(native.UninstallOptions{Purge: *purge, Out: os.Stdout})
 	case "status":
 		return runNativeStatus()
-	case "supervise": // LaunchDaemon entry point (runs as _clux)
-		return runSupervise()
+	case "supervise": // LaunchDaemon entry point (runs as the slot user)
+		fs := flag.NewFlagSet("native supervise", flag.ExitOnError)
+		slot := fs.Int("slot", 0, "slot to serve")
+		if err := fs.Parse(args[1:]); err != nil {
+			return err
+		}
+		return runSupervise(*slot)
 	case "pfd": // LaunchDaemon entry point (runs as root)
 		return runPFD()
 	default:
@@ -58,15 +67,15 @@ func daemonContext() (context.Context, context.CancelFunc) {
 	return signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 }
 
-func runSupervise() error {
-	logger := log.New(os.Stderr, "supervisor: ", log.LstdFlags)
+func runSupervise(slot int) error {
+	logger := log.New(os.Stderr, fmt.Sprintf("supervisor[%d]: ", slot), log.LstdFlags)
 	cfg, err := native.LoadConfig()
 	if err != nil {
 		return err
 	}
 	ctx, stop := daemonContext()
 	defer stop()
-	srv, err := supervisor.NewServer(supervisor.Options{Config: cfg, Version: version, Logf: logger.Printf})
+	srv, err := supervisor.NewServer(supervisor.Options{Config: cfg, Slot: slot, Version: version, Logf: logger.Printf})
 	if err != nil {
 		return err
 	}
@@ -80,10 +89,56 @@ func runPFD() error {
 	return native.RunPFD(ctx, logger.Printf)
 }
 
-func supervisorStatus(ctx context.Context) (supervisor.Response, error) {
-	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
-	return (&supervisor.Client{Socket: native.SupervisorSocket}).Call(ctx, supervisor.Request{Op: supervisor.OpStatus})
+// slotClient is the owner's client for slot n's supervisor; it refuses a
+// socket that isn't served by the slot's uid.
+func slotClient(s native.Slot) *supervisor.Client {
+	return &supervisor.Client{Socket: native.SlotSocket(s.N), ServerUID: s.UID}
+}
+
+type slotStatus struct {
+	slot native.Slot
+	resp supervisor.Response
+	err  error
+}
+
+// slotsStatus asks every slot's supervisor for its status.
+func slotsStatus(ctx context.Context, cfg *native.Config) []slotStatus {
+	out := make([]slotStatus, len(cfg.Slots))
+	for i, s := range cfg.Slots {
+		sctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		r, err := slotClient(s).Call(sctx, supervisor.Request{Op: supervisor.OpStatus})
+		cancel()
+		out[i] = slotStatus{slot: s, resp: r, err: err}
+	}
+	return out
+}
+
+// supervisorsSummary folds the slots' answers into one version + sandbox
+// state for the capabilities: the sandbox is "active" only if every
+// answering slot says so; an error only if no slot answers.
+func supervisorsSummary(st []slotStatus) (version, sandbox string, err error) {
+	sandbox = supervisor.SandboxActive
+	ok := 0
+	for _, s := range st {
+		if s.err != nil {
+			err = s.err
+			continue
+		}
+		ok++
+		if version == "" {
+			version = s.resp.Version
+		}
+		if s.resp.Sandbox != supervisor.SandboxActive {
+			sandbox = supervisor.SandboxUnavailable
+		}
+	}
+	if ok == 0 {
+		if err == nil {
+			err = errors.New("no native slots")
+		}
+		return "", supervisor.SandboxUnavailable, err
+	}
+	return version, sandbox, nil
 }
 
 func runNativeStatus() error {
@@ -101,15 +156,8 @@ func runNativeStatus() error {
 	}
 	fmt.Printf("native macOS runtime: installed %s by clux %s (%s)\n", cfg.InstalledAt, cfg.CLIVersion, native.ConfigPath)
 	fmt.Printf("  owner:         %s (uid %d)\n", cfg.OwnerUser, cfg.OwnerUID)
-	agent := "missing"
-	if u, err := user.Lookup(cfg.AgentUser); err == nil {
-		agent = "uid " + u.Uid
-	}
-	fmt.Printf("  agent user:    %s (%s), home %s\n", cfg.AgentUser, agent, native.AgentHome)
 	fmt.Printf("  egress proxy:  127.0.0.1:%d and [::1]:%d (served by `clux host start`)\n", cfg.ProxyPort, cfg.ProxyPort)
-	for _, label := range []string{native.PFLabel, native.SupervisorLabel} {
-		fmt.Printf("  %-29s %s\n", label+":", launchdState(label))
-	}
+	fmt.Printf("  %-29s %s\n", native.PFLabel+":", launchdState(native.PFLabel))
 	if st, err := native.ReadPFStatus(); err != nil {
 		fmt.Printf("  pf:            unknown (%v)\n", err)
 	} else {
@@ -117,20 +165,31 @@ func runNativeStatus() error {
 		if st.Active(time.Now()) {
 			state = "active"
 		}
-		fmt.Printf("  pf:            %s (enabled=%v, anchor %s loaded=%v, %d agent listener port(s), updated %s)\n",
-			state, st.Enabled, st.Anchor, st.RulesLoaded, st.ListenerPorts, st.Updated)
+		fmt.Printf("  pf:            %s (enabled=%v, anchor %s loaded=%v, main ruleset evaluates it=%v, uids %v, %d listener port(s), updated %s)\n",
+			state, st.Enabled, st.Anchor, st.RulesLoaded, st.MainAnchor, st.UIDs, st.ListenerPorts, st.Updated)
 		if st.Error != "" {
 			fmt.Printf("                 last error: %s\n", st.Error)
 		}
 	}
-	resp, err := supervisorStatus(context.Background())
-	if err != nil {
-		fmt.Printf("  supervisor:    not reachable: %v\n", err)
-		return nil
-	}
-	fmt.Printf("  supervisor:    version %s, sandbox %s, %d workspace(s)\n", resp.Version, resp.Sandbox, len(resp.Workspaces))
-	for _, w := range resp.Workspaces {
-		fmt.Printf("    workspace %s: running=%v pid=%d port=%d runtime=%s\n", w.ID, w.Running, w.PID, w.Port, w.RuntimeVersion)
+	fmt.Printf("  slots:         %d (agent users, one workspace each; homes %s/<n>)\n", len(cfg.Slots), native.SlotsDir)
+	for _, s := range slotsStatus(context.Background(), cfg) {
+		acct := "MISSING"
+		if u, err := user.Lookup(s.slot.User); err == nil && u.Uid == fmt.Sprint(s.slot.UID) {
+			acct = "uid " + u.Uid
+		}
+		fmt.Printf("    slot %d %s (%s), %s: ", s.slot.N, s.slot.User, acct, launchdState(native.SupervisorLabel(s.slot.N)))
+		if s.err != nil {
+			fmt.Printf("supervisor not reachable: %v\n", s.err)
+			continue
+		}
+		holds := "free"
+		if len(s.resp.Resident) > 0 {
+			holds = "workspace " + strings.Join(s.resp.Resident, ", ")
+		}
+		fmt.Printf("version %s, sandbox %s, %s\n", s.resp.Version, s.resp.Sandbox, holds)
+		for _, w := range s.resp.Workspaces {
+			fmt.Printf("      workspace %s: running=%v pid=%d port=%d runtime=%s\n", w.ID, w.Running, w.PID, w.Port, w.RuntimeVersion)
+		}
 	}
 	return nil
 }
@@ -166,21 +225,34 @@ func nativeDoctor(check func(name string, err error)) {
 		check("native: installed for this user", fmt.Errorf("installed for %s (uid %d); run `sudo clux native install` from this account", cfg.OwnerUser, cfg.OwnerUID))
 		return
 	}
-	_, uerr := user.Lookup(cfg.AgentUser)
-	check("native: agent user "+cfg.AgentUser+" exists", uerr)
 	st, perr := native.ReadPFStatus()
 	if perr == nil && !st.Active(time.Now()) {
-		perr = fmt.Errorf("pf daemon not keeping the firewall active (enabled=%v, anchor loaded=%v, updated %s); see %s/pf.log", st.Enabled, st.RulesLoaded, st.Updated, native.LogDir)
+		perr = fmt.Errorf("pf daemon not keeping the firewall active (enabled=%v, anchor loaded=%v, main ruleset evaluates it=%v, updated %s); see %s/pf.log",
+			st.Enabled, st.RulesLoaded, st.MainAnchor, st.Updated, native.LogDir)
 	}
-	check("native: pf firewall active for the agent user", perr)
-	resp, serr := supervisorStatus(context.Background())
-	check("native: supervisor reachable", serr)
-	if serr == nil {
-		var sbErr error
-		if resp.Sandbox != supervisor.SandboxActive {
-			sbErr = fmt.Errorf("Seatbelt self-check failed; workspaces run with user + pf isolation only (see %s/supervisor.log)", native.LogDir)
+	if perr == nil {
+		for _, u := range cfg.AgentUIDs() {
+			if !st.Covers(u) {
+				perr = fmt.Errorf("pf rules don't cover agent uid %d; re-run `sudo clux native install`", u)
+				break
+			}
 		}
-		check("native: Seatbelt sandbox active", sbErr)
+	}
+	check("native: pf firewall active for every agent user", perr)
+	for _, s := range slotsStatus(context.Background(), cfg) {
+		name := fmt.Sprintf("native: slot %d (%s)", s.slot.N, s.slot.User)
+		if u, err := user.Lookup(s.slot.User); err != nil || u.Uid != fmt.Sprint(s.slot.UID) {
+			check(name+" account", fmt.Errorf("account missing or uid changed; re-run `sudo clux native install`"))
+			continue
+		}
+		check(name+" supervisor reachable", s.err)
+		if s.err == nil {
+			var sbErr error
+			if s.resp.Sandbox != supervisor.SandboxActive {
+				sbErr = fmt.Errorf("Seatbelt self-check failed; workspaces run with user + pf isolation only (see %s)", native.SupervisorLog(s.slot.N))
+			}
+			check(name+" Seatbelt sandbox active", sbErr)
+		}
 	}
 	f, werr := os.CreateTemp(filepath.Join(native.RuntimeRoot, "sidecar"), ".doctor-")
 	if werr == nil {
@@ -191,8 +263,10 @@ func nativeDoctor(check func(name string, err error)) {
 }
 
 // nativeHost is the owner-side half of the native runtime inside `clux host
-// start`: the egress proxy, the runtime installer and the supervisor client.
+// start`: the egress proxy, the runtime installer, the slot assignments and
+// the supervisor clients.
 type nativeHost struct {
+	cfg     *native.Config
 	proxy   *egress.Proxy
 	runtime *hostsession.NativeRuntime
 }
@@ -215,6 +289,11 @@ func setupNative(ctx context.Context, cfg *config.Config, stateDir string) *nati
 		log.Printf("native runtime disabled: installed for %s (uid %d), not this user", ncfg.OwnerUser, ncfg.OwnerUID)
 		return nil
 	}
+	slots, err := hostsession.LoadSlotMap(filepath.Join(stateDir, filepath.Base(native.OwnerSlotMapFile)), len(ncfg.Slots))
+	if err != nil {
+		log.Printf("native runtime disabled: slot assignments: %v", err)
+		return nil
+	}
 	key, err := egress.LoadOrCreateKey(filepath.Join(stateDir, "egress.key"))
 	if err != nil {
 		log.Printf("native runtime disabled: egress proxy key: %v", err)
@@ -227,11 +306,22 @@ func setupNative(ctx context.Context, cfg *config.Config, stateDir string) *nati
 		return nil
 	}
 	go proxy.Run(ctx)
-	log.Printf("native macOS runtime enabled (egress proxy on 127.0.0.1:%d)", ncfg.ProxyPort)
+	clients := map[int]hostsession.SupervisorCaller{}
+	for _, s := range ncfg.Slots {
+		clients[s.N] = slotClient(s)
+	}
+	log.Printf("native macOS runtime enabled (%d slot(s), %d free; egress proxy on 127.0.0.1:%d)", slots.Total(), slots.Free(), ncfg.ProxyPort)
 	return &nativeHost{
+		cfg:   ncfg,
 		proxy: proxy,
 		runtime: &hostsession.NativeRuntime{
-			Supervisor: &supervisor.Client{Socket: native.SupervisorSocket},
+			Supervisor: func(n int) hostsession.SupervisorCaller {
+				if c, ok := clients[n]; ok {
+					return c
+				}
+				return missingSlot(n)
+			},
+			Slots: slots,
 			Installer: &sidecarrt.Installer{
 				Root: native.RuntimeRoot, BackendURL: cfg.BackendURL, Token: cfg.Token, Logf: log.Printf,
 			},
@@ -239,4 +329,12 @@ func setupNative(ctx context.Context, cfg *config.Config, stateDir string) *nati
 			ProxyPort: ncfg.ProxyPort,
 		},
 	}
+}
+
+// missingSlot answers for a slot the install no longer has (pool shrunk
+// while a workspace still held it).
+type missingSlot int
+
+func (m missingSlot) Call(context.Context, supervisor.Request) (supervisor.Response, error) {
+	return supervisor.Response{}, fmt.Errorf("native slot %d is not installed any more; re-run `sudo clux native install --slots %d`", int(m), int(m))
 }

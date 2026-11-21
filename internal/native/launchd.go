@@ -13,14 +13,16 @@ func PFDaemonPlist(binary string) string {
 	return plist(PFLabel, "", []string{binary, "native", "pfd"}, nil, "", LogDir+"/pf.log")
 }
 
-// SupervisorPlist runs `clux native supervise` as the agent user. It has
-// to be a LaunchDaemon with UserName (launchctl managername = System):
-// started from the owner's GUI session (e.g. via sudo -u) the agent would
-// keep the owner's Aqua bootstrap -- Finder Apple Events, the pasteboard
-// and `open -a` all worked from there in the spike.
-func SupervisorPlist(binary string) string {
-	return plist(SupervisorLabel, AgentUser, []string{binary, "native", "supervise"},
-		map[string]string{"HOME": AgentHome}, AgentHome, LogDir+"/supervisor.log")
+// SupervisorPlist runs `clux native supervise --slot n` as slot n's user.
+// It has to be a LaunchDaemon with UserName (launchctl managername =
+// System): started from the owner's GUI session (e.g. via sudo -u) the
+// agent would keep the owner's Aqua bootstrap -- Finder Apple Events, the
+// pasteboard and `open -a` all worked from there in the spike. launchd
+// initializes the supplementary groups (_cluxslots: read access to the
+// runtime).
+func SupervisorPlist(binary string, n int) string {
+	return plist(SupervisorLabel(n), SlotUser(n), []string{binary, "native", "supervise", "--slot", fmt.Sprint(n)},
+		map[string]string{"HOME": SlotHome(n)}, SlotHome(n), SupervisorLog(n))
 }
 
 func plist(label, user string, args []string, env map[string]string, wd, logPath string) string {
@@ -34,7 +36,8 @@ func plist(label, user string, args []string, env map[string]string, wd, logPath
 	kv("Label", label)
 	if user != "" {
 		kv("UserName", user)
-		kv("GroupName", AgentGroup)
+		kv("GroupName", user)
+		b.WriteString("  <key>InitGroups</key><true/>\n")
 	}
 	b.WriteString("  <key>ProgramArguments</key>\n  <array>\n")
 	for _, a := range args {

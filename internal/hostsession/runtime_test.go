@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -114,8 +115,9 @@ func TestEgressWithoutCorrelationIDSendsNoResult(t *testing.T) {
 }
 
 type fakeSupervisor struct {
-	reqs []supervisor.Request
-	err  error
+	reqs     []supervisor.Request
+	err      error
+	resident []string
 }
 
 func (f *fakeSupervisor) Call(_ context.Context, req supervisor.Request) (supervisor.Response, error) {
@@ -129,7 +131,7 @@ func (f *fakeSupervisor) Call(_ context.Context, req supervisor.Request) (superv
 	case supervisor.OpDelete:
 		return supervisor.Response{OK: true, FreedBytes: 3 << 30}, nil
 	case supervisor.OpStatus:
-		return supervisor.Response{OK: true, Workspaces: []supervisor.WorkspaceStatus{{ID: "5", Running: true, RuntimeVersion: "old"}}}, nil
+		return supervisor.Response{OK: true, Resident: f.resident, Workspaces: []supervisor.WorkspaceStatus{{ID: "5", Running: true, RuntimeVersion: "old"}}}, nil
 	}
 	return supervisor.Response{OK: true}, nil
 }
@@ -154,7 +156,7 @@ func TestNativeRuntimeStart(t *testing.T) {
 	sup := &fakeSupervisor{}
 	inst := &fakeInstaller{}
 	p := egress.New([]byte("k"), "")
-	n := &NativeRuntime{Supervisor: sup, Installer: inst, Egress: p, ProxyPort: 47821}
+	n := &NativeRuntime{Supervisor: one(sup), Slots: testSlots(t, 1), Installer: inst, Egress: p, ProxyPort: 47821}
 	res, err := n.Start(context.Background(), decode(t, nativeStart))
 	if err != nil {
 		t.Fatal(err)
@@ -179,7 +181,7 @@ func TestNativeRuntimeStart(t *testing.T) {
 }
 
 func TestNativeRuntimeValidatesInput(t *testing.T) {
-	n := &NativeRuntime{Supervisor: &fakeSupervisor{}, Installer: &fakeInstaller{}, Egress: egress.New([]byte("k"), ""), ProxyPort: 47821}
+	n := &NativeRuntime{Supervisor: one(&fakeSupervisor{}), Slots: testSlots(t, 2), Installer: &fakeInstaller{}, Egress: egress.New([]byte("k"), ""), ProxyPort: 47821}
 	for _, mut := range []func(map[string]any){
 		func(f map[string]any) { delete(f, "sidecar_bundle") },
 		func(f map[string]any) { delete(f, "hmac_secret") },
@@ -198,7 +200,13 @@ func TestNativeRuntimeDeleteAndErrors(t *testing.T) {
 	sup := &fakeSupervisor{}
 	p := egress.New([]byte("k"), "")
 	p.SetPolicy("12", egress.Policy{})
-	n := &NativeRuntime{Supervisor: sup, Installer: &fakeInstaller{}, Egress: p, ProxyPort: 47821}
+	n := &NativeRuntime{Supervisor: one(sup), Slots: testSlots(t, 2), Installer: &fakeInstaller{}, Egress: p, ProxyPort: 47821}
+	if _, err := n.Slots.Assign("12", nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := n.Slots.Assign("13", nil); err != nil {
+		t.Fatal(err)
+	}
 	res, err := n.Delete(context.Background(), decode(t, `{"runtime":"native_macos","workspace_id":12}`))
 	if err != nil || res["freed_storage_gb"] != 3 {
 		t.Fatalf("%v %v", res, err)
@@ -206,9 +214,100 @@ func TestNativeRuntimeDeleteAndErrors(t *testing.T) {
 	if _, ok := p.Policy("12"); ok {
 		t.Fatal("delete must drop the egress policy")
 	}
+	if _, ok := n.Slots.Lookup("12"); ok || n.Slots.Free() != 1 {
+		t.Fatal("delete must free the slot")
+	}
+	// Never started: nothing to stop or delete, no supervisor call.
+	calls := len(sup.reqs)
+	if err := n.Stop(context.Background(), decode(t, `{"workspace_id":99}`)); err != nil {
+		t.Fatal(err)
+	}
+	if res, err := n.Delete(context.Background(), decode(t, `{"workspace_id":99}`)); err != nil || res["freed_storage_gb"] != 0 {
+		t.Fatalf("%v %v", res, err)
+	}
+	if len(sup.reqs) != calls {
+		t.Fatal("supervisor called for a workspace without a slot")
+	}
 	sup.err = errors.New("native supervisor not reachable")
-	if err := n.Stop(context.Background(), decode(t, `{"workspace_id":12}`)); err == nil {
+	if err := n.Stop(context.Background(), decode(t, `{"workspace_id":13}`)); err == nil {
 		t.Fatal("supervisor error swallowed")
+	}
+	if _, err := n.Delete(context.Background(), decode(t, `{"workspace_id":13}`)); err == nil {
+		t.Fatal("supervisor error swallowed")
+	}
+	if _, ok := n.Slots.Lookup("13"); !ok {
+		t.Fatal("a failed delete must keep the slot (its files are still there)")
+	}
+}
+
+func one(s SupervisorCaller) func(int) SupervisorCaller {
+	return func(int) SupervisorCaller { return s }
+}
+
+func testSlots(t *testing.T, n int) *SlotMap {
+	t.Helper()
+	m, err := LoadSlotMap(filepath.Join(t.TempDir(), "native-slots.json"), n)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return m
+}
+
+// Each workspace gets a slot of its own for its whole life; with all slots
+// held, a start fails with a clear message.
+func TestNativeRuntimeAssignsSlots(t *testing.T) {
+	sups := map[int]*fakeSupervisor{1: {}, 2: {resident: []string{"77"}}, 3: {}}
+	path := filepath.Join(t.TempDir(), "native-slots.json")
+	slots, _ := LoadSlotMap(path, 3)
+	n := &NativeRuntime{
+		Supervisor: func(i int) SupervisorCaller { return sups[i] },
+		Slots:      slots, Installer: &fakeInstaller{}, Egress: egress.New([]byte("k"), ""), ProxyPort: 47821,
+	}
+	start := func(id string) error {
+		f := decode(t, nativeStart)
+		f["workspace_id"] = id
+		_, err := n.Start(context.Background(), f)
+		return err
+	}
+	if err := start("12"); err != nil {
+		t.Fatal(err)
+	}
+	if err := start("13"); err != nil { // slot 2 holds another workspace's files: skipped
+		t.Fatal(err)
+	}
+	if s, _ := slots.Lookup("12"); s != 1 {
+		t.Fatalf("12 -> slot %d", s)
+	}
+	if s, _ := slots.Lookup("13"); s != 3 {
+		t.Fatalf("13 -> slot %d, want 3", s)
+	}
+	if err := start("12"); err != nil { // restart keeps the slot
+		t.Fatal(err)
+	}
+	if s, _ := slots.Lookup("12"); s != 1 {
+		t.Fatal("restart moved the workspace")
+	}
+	err := start("14")
+	if err == nil || !strings.Contains(err.Error(), "all 3 native slots in use; run `sudo clux native install --slots 4`") {
+		t.Fatalf("full pool: %v", err)
+	}
+	for i, sup := range sups {
+		for _, r := range sup.reqs {
+			if r.Op == supervisor.OpStart && (i == 1) != (r.WorkspaceID == "12") {
+				t.Fatalf("slot %d got start of workspace %s", i, r.WorkspaceID)
+			}
+			if r.Op == supervisor.OpStart && i == 2 {
+				t.Fatal("slot holding another workspace's files got a start")
+			}
+		}
+	}
+	// Persisted: a restarted host agent keeps the assignments.
+	again, err := LoadSlotMap(path, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s, _ := again.Lookup("13"); s != 3 || again.Free() != 1 {
+		t.Fatalf("reloaded: 13 -> %d, free %d", s, again.Free())
 	}
 }
 

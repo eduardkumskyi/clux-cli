@@ -6,9 +6,10 @@
 // It runs in `clux host start`, as the owner, not in the agent-user
 // supervisor: the bundle download needs the host's PAT (which must never
 // reach the agent user), and the agent user has no network except the
-// egress proxy. The result lives in native.RuntimeRoot (owner:_clux 0750):
-// readable and executable by the agent, writable only by the owner, so a
-// compromised workspace can't tamper with the code later workspaces run.
+// egress proxy. The result lives in native.RuntimeRoot (owner:_cluxslots
+// 0750): readable and executable by every slot user, writable only by the
+// owner, so a compromised workspace can't tamper with the code later
+// workspaces run.
 //
 // Supply chain: the bundle is checked against the sha256 the backend sent;
 // uv is a pinned release checked against a pinned sha256; uv checks the

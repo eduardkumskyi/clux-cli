@@ -191,8 +191,10 @@ func nativeHealth() error {
 	if !st.Active(time.Now()) {
 		return errors.New("pf firewall not active")
 	}
-	if _, err := supervisorStatus(context.Background()); err != nil {
-		return fmt.Errorf("supervisor not reachable: %w", err)
+	for _, s := range slotsStatus(context.Background(), cfg) {
+		if s.err != nil {
+			return fmt.Errorf("slot %d supervisor not reachable: %w", s.slot.N, s.err)
+		}
 	}
 	return nil
 }
