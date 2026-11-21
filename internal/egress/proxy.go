@@ -20,6 +20,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 )
 
@@ -77,6 +78,9 @@ type Proxy struct {
 	dial   func(ctx context.Context, network, addr string) (net.Conn, error)
 	lookup func(ctx context.Context, host string) ([]net.IP, error)
 	now    func() time.Time
+	// localAddrs lists the addresses assigned to this machine's interfaces
+	// (read fresh on every check: SLAAC temporary addresses come and go).
+	localAddrs func() ([]net.IP, error)
 
 	mu      sync.Mutex
 	sender  Sender
@@ -101,13 +105,12 @@ type pending struct {
 // New returns a proxy whose per-workspace passwords are derived from key.
 // stateDir (optional) persists policies so allow_project survives a restart.
 func New(key []byte, stateDir string) *Proxy {
-	d := &net.Dialer{Timeout: upstreamTimeout, KeepAlive: 30 * time.Second}
 	p := &Proxy{
 		HoldTimeout:   DefaultHoldTimeout,
 		FlushInterval: DefaultFlushInterval,
 		key:           key,
 		stateDir:      stateDir,
-		dial:          d.DialContext,
+		localAddrs:    interfaceAddrs,
 		lookup: func(ctx context.Context, host string) ([]net.IP, error) {
 			addrs, err := net.DefaultResolver.LookupIPAddr(ctx, host)
 			ips := make([]net.IP, 0, len(addrs))
@@ -120,8 +123,64 @@ func New(key []byte, stateDir string) *Proxy {
 		ws:      map[string]*workspace{},
 		pending: map[string]*pending{},
 	}
+	// The connect itself is checked again (admit already refused local
+	// addresses): an address can be assigned to an interface in between.
+	d := &net.Dialer{Timeout: upstreamTimeout, KeepAlive: 30 * time.Second,
+		Control: func(_, address string, _ syscall.RawConn) error {
+			host, _, err := net.SplitHostPort(address)
+			if err != nil {
+				return err
+			}
+			if ip := net.ParseIP(host); ip == nil || p.isLocal(ip) {
+				return fmt.Errorf("egress: %s is this machine's own address", host)
+			}
+			return nil
+		}}
+	p.dial = d.DialContext
 	p.loadState()
 	return p
+}
+
+// interfaceAddrs lists every address assigned to a local interface.
+func interfaceAddrs() ([]net.IP, error) {
+	addrs, err := net.InterfaceAddrs()
+	if err != nil {
+		return nil, err
+	}
+	ips := make([]net.IP, 0, len(addrs))
+	for _, a := range addrs {
+		switch v := a.(type) {
+		case *net.IPNet:
+			ips = append(ips, v.IP)
+		case *net.IPAddr:
+			ips = append(ips, v.IP)
+		}
+	}
+	return ips, nil
+}
+
+// isLocal reports whether ip is assigned to one of this machine's
+// interfaces (its public IPv4 or global/temporary IPv6 included): an
+// owner service bound to a wildcard address answers there, so the agent
+// must never reach it. When the interface list can't be read, everything
+// counts as local (fail closed).
+func (p *Proxy) isLocal(ip net.IP) bool {
+	if ip.IsLoopback() || ip.IsUnspecified() {
+		return true
+	}
+	if p.localAddrs == nil {
+		return false
+	}
+	addrs, err := p.localAddrs()
+	if err != nil {
+		return true
+	}
+	for _, a := range addrs {
+		if a.Equal(ip) {
+			return true
+		}
+	}
+	return false
 }
 
 // LoadOrCreateKey reads the proxy secret from path, creating a random one
@@ -526,10 +585,13 @@ func (p *Proxy) admit(ctx context.Context, id, rawHost string, port int) (string
 		return "", errors.New("unknown workspace")
 	}
 	literal := net.ParseIP(host)
-	if literal != nil && !isPublic(literal) {
+	if literal != nil && p.isLocal(literal) {
 		if literal.IsLoopback() || literal.IsUnspecified() {
 			return "", errors.New("loopback is never reachable (that is the owner's own machine)")
 		}
+		return "", errors.New("this machine's own address is never reachable (the owner's services listen there)")
+	}
+	if literal != nil && !isPublic(literal) {
 		if !pol.allowsPrivateIP(literal, port) {
 			return "", errors.New("private/LAN address: needs an explicit IP or CIDR entry in the project's egress allow list")
 		}
@@ -551,11 +613,11 @@ func (p *Proxy) admit(ctx context.Context, id, rawHost string, port int) (string
 		return "", fmt.Errorf("resolving: %w", err)
 	}
 	for _, ip := range ips {
-		if isPublic(ip) {
+		if isPublic(ip) && !p.isLocal(ip) {
 			return net.JoinHostPort(ip.String(), strconv.Itoa(port)), nil
 		}
 	}
-	return "", errors.New("resolves only to local or private addresses (host names reach public addresses only; use an IP/CIDR entry for LAN hosts)")
+	return "", errors.New("resolves only to this machine, local or private addresses (host names reach public addresses only; use an IP/CIDR entry for LAN hosts)")
 }
 
 // ask sends one egress.request (shared by concurrent connections to the

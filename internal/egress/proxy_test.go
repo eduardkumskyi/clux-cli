@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -93,6 +94,7 @@ func testProxy(t *testing.T, resolveTo string) (*Proxy, string) {
 	p.dial = func(ctx context.Context, network, addr string) (net.Conn, error) {
 		return net.Dial("tcp", echo.Addr().String())
 	}
+	p.localAddrs = fakeLocalAddrs
 	l, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -300,6 +302,67 @@ func TestLocalDestinationsNeverReachable(t *testing.T) {
 	for _, target := range []string{"localhost:5433", "127.0.0.1:5433", "[::1]:5433", "db.local:5432"} {
 		if code, _ := connect(t, addr, target, auth(p, "7")); code != 403 {
 			t.Fatalf("%s: %d", target, code)
+		}
+	}
+}
+
+// fakeLocalAddrs: the test "machine" has a public IPv4, a global IPv6 and
+// a LAN address.
+func fakeLocalAddrs() ([]net.IP, error) {
+	return []net.IP{net.ParseIP("127.0.0.1"), net.ParseIP("::1"), net.ParseIP("203.0.113.9"),
+		net.ParseIP("2a01:4f8:1:2::9"), net.ParseIP("192.168.1.42")}, nil
+}
+
+// The Mac's own addresses (public IPv4, global or temporary IPv6, LAN) reach
+// the owner's wildcard-bound services: never, by literal, name or CIDR.
+func TestOwnMachineAddressesNeverReachable(t *testing.T) {
+	p, addr := testProxy(t, "203.0.113.9") // a name resolving to the Mac itself
+	p.SetPolicy("7", Policy{Mode: ModeOpen, Allow: []string{"192.168.1.0/24", "2a01:4f8:1:2::/64"}})
+	for target, want := range map[string]int{
+		"myself.example:443":      403,
+		"203.0.113.9:443":         403,
+		"[2a01:4f8:1:2::9]:22":    403,
+		"192.168.1.42:22":         403,
+		"192.168.1.43:22":         200, // a LAN neighbour the CIDR entry allows
+		"[2a01:4f8:1:2::10]:443":  200, // another public host
+		"[::ffff:203.0.113.9]:80": 403, // v4-mapped form of the same address
+	} {
+		if code, _ := connect(t, addr, target, auth(p, "7")); code != want {
+			t.Errorf("%s: %d, want %d", target, code, want)
+		}
+	}
+
+	// The interface list can't be read: everything is "local".
+	p.localAddrs = func() ([]net.IP, error) { return nil, errors.New("sysctl failed") }
+	if code, _ := connect(t, addr, "[2a01:4f8:1:2::10]:443", auth(p, "7")); code != 403 {
+		t.Errorf("unknown local addresses must fail closed: %d", code)
+	}
+}
+
+// The real dialer re-checks at connect time (an address can be assigned to
+// an interface between admit and the dial).
+func TestDialerRefusesOwnAddresses(t *testing.T) {
+	p := New([]byte("k"), "")
+	p.localAddrs = fakeLocalAddrs
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	for _, a := range []string{"203.0.113.9:443", "[2a01:4f8:1:2::9]:22", "127.0.0.1:1"} {
+		if _, err := p.dial(ctx, "tcp", a); err == nil || !strings.Contains(err.Error(), "own address") {
+			t.Errorf("dial %s: %v", a, err)
+		}
+	}
+	// With the real interface list: this machine's addresses are refused.
+	p.localAddrs = interfaceAddrs
+	ips, err := interfaceAddrs()
+	if err != nil || len(ips) == 0 {
+		t.Skipf("no interfaces: %v", err)
+	}
+	for _, ip := range ips {
+		if ip.IsLinkLocalUnicast() {
+			continue // needs a zone to dial
+		}
+		if _, err := p.dial(ctx, "tcp", net.JoinHostPort(ip.String(), "9")); err == nil || !strings.Contains(err.Error(), "own address") {
+			t.Errorf("dial own %s: %v", ip, err)
 		}
 	}
 }
