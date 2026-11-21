@@ -29,6 +29,7 @@ type fakeBackend struct {
 	mu        sync.Mutex
 	conn      *websocket.Conn
 	closeCode int
+	reg       map[string]any
 }
 
 func newFakeBackend(t *testing.T, mode string) *fakeBackend {
@@ -47,6 +48,9 @@ func newFakeBackend(t *testing.T, mode string) *fakeBackend {
 		if err := c.ReadJSON(&reg); err != nil {
 			return
 		}
+		fb.mu.Lock()
+		fb.reg = reg
+		fb.mu.Unlock()
 		if fb.mode == "reject_unknown" {
 			_ = c.WriteJSON(map[string]any{"type": "register_rejected", "reason": "maintenance"})
 			return
@@ -78,6 +82,15 @@ func newFakeBackend(t *testing.T, mode string) *fakeBackend {
 					return
 				}
 			}
+		case "egress":
+			time.Sleep(50 * time.Millisecond)
+			_ = c.WriteJSON(map[string]any{"type": "egress.decision", "workspace_id": 7, "request_id": "r1", "decision": "deny"})
+			_ = c.WriteJSON(map[string]any{"type": "egress.policy", "workspace_id": 7, "mode": "open", "allow": []string{}})
+			for {
+				if _, _, err := c.ReadMessage(); err != nil {
+					return
+				}
+			}
 		case "restart":
 			time.Sleep(50 * time.Millisecond)
 			_ = c.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseServiceRestart, ""))
@@ -96,7 +109,7 @@ func newFakeBackend(t *testing.T, mode string) *fakeBackend {
 
 func dialFake(t *testing.T, fb *fakeBackend) *Session {
 	t.Helper()
-	sess, err := Dial(context.Background(), fb.srv.URL, "tok", "0.3.0", sysinfo.Info{})
+	sess, err := Dial(context.Background(), fb.srv.URL, "tok", "0.3.0", sysinfo.Info{}, nil)
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
@@ -177,7 +190,7 @@ func TestSendNeverBlocksAfterRunReturns(t *testing.T) {
 
 func TestRegisterRejectedOutdatedIsFatal(t *testing.T) {
 	fb := newFakeBackend(t, "reject_outdated")
-	_, err := Dial(context.Background(), fb.srv.URL, "tok", "0.1.0", sysinfo.Info{})
+	_, err := Dial(context.Background(), fb.srv.URL, "tok", "0.1.0", sysinfo.Info{}, nil)
 	if !IsFatal(err) {
 		t.Fatalf("want fatal error, got %v", err)
 	}
@@ -194,7 +207,7 @@ func TestSupersededIsTypedAndNotFatal(t *testing.T) {
 
 func TestUnknownRegisterRejectionRetries(t *testing.T) {
 	fb := newFakeBackend(t, "reject_unknown")
-	_, err := Dial(context.Background(), fb.srv.URL, "tok", "0.3.0", sysinfo.Info{})
+	_, err := Dial(context.Background(), fb.srv.URL, "tok", "0.3.0", sysinfo.Info{}, nil)
 	if err == nil || IsFatal(err) {
 		t.Fatalf("unknown rejection must be retryable, got %v", err)
 	}

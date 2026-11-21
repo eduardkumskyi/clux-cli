@@ -152,7 +152,12 @@ func Start(ctx context.Context, req StartRequest) (StartResult, error) {
 		args = append(args, "-e", "GITHUB_CLONE_URL="+req.GithubCloneURL)
 	}
 	if req.HMACSecret != "" {
-		args = append(args, "-e", "HMAC_SECRET="+req.HMACSecret)
+		// The sidecar reads SIDECAR_HMAC_SECRET (sidecar.py). With only
+		// HMAC_SECRET set it ran with no secret at all, which it treats as
+		// "local dev, auth off": any local process could open its control
+		// WebSocket on the published 127.0.0.1 port. HMAC_SECRET stays for
+		// images that might still look for it.
+		args = append(args, "-e", "SIDECAR_HMAC_SECRET="+req.HMACSecret, "-e", "HMAC_SECRET="+req.HMACSecret)
 	}
 	args = append(args, req.Image)
 
@@ -190,6 +195,21 @@ func Stop(ctx context.Context, containerName string) error {
 	}
 	defer unlock()
 	return stopAndRemove(ctx, containerName)
+}
+
+// Running reports whether the named container exists and is running.
+func Running(ctx context.Context, containerName string) (bool, error) {
+	if containerName == "" {
+		return false, nil
+	}
+	out, err := runDocker(ctx, "inspect", "-f", "{{.State.Running}}", containerName)
+	if err != nil {
+		if isMissingContainer(err) || containsAny(err.Error(), "No such object", "no such object") {
+			return false, nil
+		}
+		return false, err
+	}
+	return strings.TrimSpace(out) == "true", nil
 }
 
 // DeleteResult is the "extra" fields merged into the workspace.delete

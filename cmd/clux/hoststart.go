@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -19,9 +20,11 @@ import (
 
 	"github.com/eduardkumskyi/clux-cli/internal/backoff"
 	"github.com/eduardkumskyi/clux-cli/internal/config"
+	"github.com/eduardkumskyi/clux-cli/internal/egress"
 	"github.com/eduardkumskyi/clux-cli/internal/hostlock"
 	"github.com/eduardkumskyi/clux-cli/internal/hostsession"
 	"github.com/eduardkumskyi/clux-cli/internal/logx"
+	"github.com/eduardkumskyi/clux-cli/internal/native"
 	"github.com/eduardkumskyi/clux-cli/internal/netwatch"
 	"github.com/eduardkumskyi/clux-cli/internal/sysinfo"
 	"github.com/eduardkumskyi/clux-cli/internal/tunnel"
@@ -60,6 +63,7 @@ func (w logWriter) Write(p []byte) (int, error) {
 func runHostStart(args []string) error {
 	fs := flag.NewFlagSet("host start", flag.ExitOnError)
 	interval := fs.Duration("interval", defaultHeartbeat, "heartbeat interval")
+	noNativePrompt := fs.Bool("no-native-prompt", false, "macOS: don't offer to install the native runtime (set it up later with `sudo clux native install`)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -107,7 +111,24 @@ func runHostStart(args []string) error {
 	defer logger.Flush()
 	logger.Printf("clux %s starting (log: %s)", version, logPath)
 
+	// macOS: offer the native runtime once (interactive only), or warn if
+	// it is installed but unhealthy. Never blocks docker-only mode.
+	newNativeOffer(cfg, *noNativePrompt, log.Printf).run()
+
 	h := newHostLoop(cfg, *interval, logger)
+	h.caps = &native.Capabilities{Supervisor: func(ctx context.Context) (string, string, error) {
+		ncfg, err := native.LoadConfig()
+		if err != nil {
+			return "", "", err
+		}
+		return supervisorsSummary(slotsStatus(ctx, ncfg))
+	}}
+	if nh := setupNative(ctx, cfg, stateDir); nh != nil {
+		h.proxy = nh.proxy
+		h.opts.Runtimes = map[string]hostsession.Runtime{hostsession.RuntimeNativeMacOS: nh.runtime}
+		h.opts.Egress = nh.proxy
+		h.caps.FreeSlots = nh.runtime.Slots.Free
+	}
 	go h.dispatch(ctx, netwatch.Watch(ctx, netwatch.Options{}))
 	err = h.run(ctx)
 	if err != nil && tunnel.IsFatal(err) {
@@ -124,6 +145,11 @@ type hostLoop struct {
 	interval time.Duration
 	log      *logx.Logger
 	results  *hostsession.Results
+	// opts are the workspace runtimes + egress proxy every session's
+	// handler dispatches to; caps describes them in register/heartbeat.
+	opts  hostsession.Options
+	caps  *native.Capabilities
+	proxy *egress.Proxy // nil without native mode
 
 	// Network/sleep events are consumed by ONE goroutine (dispatch). It
 	// routes them to the live session (cur) if there is one, else raises
@@ -143,8 +169,16 @@ func newHostLoop(cfg *config.Config, interval time.Duration, l *logx.Logger) *ho
 		interval: interval,
 		log:      l,
 		results:  hostsession.NewResults(),
+		caps:     &native.Capabilities{},
 		wake:     make(chan struct{}, 1),
 	}
+}
+
+// capsKey makes capabilities comparable, so heartbeats carry them only when
+// they changed.
+func capsKey(c map[string]any) string {
+	b, _ := json.Marshal(c)
+	return string(b)
 }
 
 func (h *hostLoop) run(ctx context.Context) error {
@@ -286,10 +320,12 @@ func (h *hostLoop) session(ctx context.Context) (lived time.Duration, immediate 
 		return 0, false, fmt.Errorf("collecting system info: %w", err)
 	}
 
-	sess, err := tunnel.Dial(ctx, h.cfg.BackendURL, h.cfg.Token, version, info)
+	caps := h.caps.Collect(ctx)
+	sess, err := tunnel.Dial(ctx, h.cfg.BackendURL, h.cfg.Token, version, info, caps)
 	if err != nil {
 		return 0, false, err
 	}
+	sentCaps := capsKey(caps)
 	registeredAt := time.Now()
 	h.log.Flush()
 	if h.downSince.IsZero() {
@@ -316,7 +352,13 @@ func (h *hostLoop) session(ctx context.Context) (lived time.Duration, immediate 
 					h.log.Printf("collecting system info for heartbeat: %v", err)
 					continue
 				}
-				sess.SendHeartbeat(info, version)
+				// Capabilities ride along only when they changed (e.g. the
+				// supervisor came up, or Xcode was updated).
+				var changed map[string]any
+				if c := h.caps.Collect(sessionCtx); capsKey(c) != sentCaps {
+					changed, sentCaps = c, capsKey(c)
+				}
+				sess.SendHeartbeat(info, version, changed)
 			}
 		}
 	}()
@@ -324,9 +366,15 @@ func (h *hostLoop) session(ctx context.Context) (lived time.Duration, immediate 
 	if n := h.results.Attach(sess); n > 0 {
 		h.log.Printf("re-sent %d command result(s) from the previous connection", n)
 	}
-	handler := hostsession.New(ctx, sess, h.results)
+	handler := hostsession.New(ctx, sess, h.results, h.opts)
 	h.setCurrent(sess)
+	if h.proxy != nil {
+		h.proxy.SetSender(sess)
+	}
 	runErr := sess.Run(sessionCtx, handler)
+	if h.proxy != nil {
+		h.proxy.SetSender(nil)
+	}
 	h.setCurrent(nil)
 	h.results.Detach(sess)
 	handler.Close()
