@@ -274,7 +274,9 @@ func migrateLegacy(out io.Writer) int {
 	if !haveUser && plistErr != nil && (rootErr != nil || root == 0) {
 		return 0
 	}
-	fmt.Fprintf(out, "[INFO] migrating the single-user native layout (%s) to per-workspace slots\n", LegacyAgentUser)
+	if plistErr == nil || rootErr == nil && root != 0 {
+		fmt.Fprintf(out, "[INFO] migrating the single-user native layout (%s) to per-workspace slots\n", LegacyAgentUser)
+	} // else only the account record is left (it needs Full Disk Access to delete)
 	_, _ = run("/bin/launchctl", "bootout", "system/"+SupervisorLabelPrefix)
 	// The old pf daemon kept its enable token in a run dir the agent owned;
 	// release that reference now (the new daemon takes its own), or it
@@ -297,6 +299,11 @@ func migrateLegacy(out io.Writer) int {
 	}
 	if rootErr == nil && root != 0 {
 		kept, err := quarantineAs(AgentRoot, filepath.Base(AgentRoot)+"-legacy-"+time.Now().UTC().Format("20060102T150405"))
+		if err != nil {
+			// Seen on macOS 15.6: renaming to a new visible name fails with
+			// EPERM where a dot-name works.
+			kept, err = quarantine(AgentRoot)
+		}
 		if err != nil {
 			fmt.Fprintf(out, "[WARN] moving the old %s aside: %v\n", AgentRoot, err)
 		} else {
