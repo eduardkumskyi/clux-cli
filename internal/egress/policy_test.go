@@ -1,6 +1,9 @@
 package egress
 
-import "testing"
+import (
+	"net"
+	"testing"
+)
 
 func TestMatchPattern(t *testing.T) {
 	cases := []struct {
@@ -21,6 +24,10 @@ func TestMatchPattern(t *testing.T) {
 		{"10.0.0.5", "10.0.0.5", 5432, true},
 		{"[2001:db8::1]:443", "2001:db8::1", 443, true},
 		{"2001:db8::1", "2001:db8::1", 443, true},
+		{"10.0.0.0/8", "10.9.8.7", 22, true},
+		{"10.0.0.0/8:22", "10.9.8.7", 23, false},
+		{"10.0.0.0/8", "11.0.0.1", 22, false},
+		{"10.0.0.0/8", "ten.example.com", 22, false},
 		{"", "example.com", 443, false},
 	}
 	for _, c := range cases {
@@ -46,13 +53,43 @@ func TestPolicyAllows(t *testing.T) {
 	}
 }
 
-func TestListsExactlyIgnoresWildcards(t *testing.T) {
-	p := Policy{Mode: ModeOpen, Allow: []string{"*.corp.lan", "db.corp.lan:5432"}}
-	if p.listsExactly("x.corp.lan", 443) {
-		t.Fatal("wildcard must not count as an explicit entry")
+func TestAllowsPrivateIPOnlyByAddressEntries(t *testing.T) {
+	p := Policy{Mode: ModeOpen, Allow: []string{
+		"*.corp.lan", "db.corp.lan", "10.0.0.5", "192.168.1.0/24:5432", "[fd00::7]:443", "fd12::/16",
+	}}
+	cases := []struct {
+		ip   string
+		port int
+		want bool
+	}{
+		{"10.0.0.5", 22, true},
+		{"10.0.0.6", 22, false},
+		{"192.168.1.9", 5432, true},
+		{"192.168.1.9", 80, false}, // CIDR entry is port-restricted
+		{"fd00::7", 443, true},
+		{"fd00::7", 80, false},
+		{"fd12::1", 1, true},
+		{"172.16.0.1", 443, false}, // names (exact or wildcard) never count
 	}
-	if !p.listsExactly("db.corp.lan", 5432) {
-		t.Fatal("explicit host:port entry not found")
+	for _, c := range cases {
+		if got := p.allowsPrivateIP(net.ParseIP(c.ip), c.port); got != c.want {
+			t.Errorf("allowsPrivateIP(%s, %d) = %v, want %v", c.ip, c.port, got, c.want)
+		}
+	}
+}
+
+func TestIsPublic(t *testing.T) {
+	for ip, want := range map[string]bool{
+		"93.184.216.34": true, "2606:4700::1111": true,
+		"10.1.2.3": false, "172.20.0.1": false, "192.168.0.1": false, "100.64.1.1": false,
+		"169.254.169.254": false, "127.0.0.1": false, "0.0.0.0": false, "224.0.0.1": false,
+		"::1": false, "fe80::1": false, "fd00::1": false, "ff02::1": false,
+		"::ffff:10.0.0.1": false, "64:ff9b::a00:1": false, "64:ff9b::5db8:d822": true,
+		"2002:c0a8:0101::1": false, "2001:db8::1": false, "2001:0::1": false,
+	} {
+		if got := isPublic(net.ParseIP(ip)); got != want {
+			t.Errorf("isPublic(%s) = %v, want %v", ip, got, want)
+		}
 	}
 }
 

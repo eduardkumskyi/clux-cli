@@ -304,18 +304,51 @@ func TestLocalDestinationsNeverReachable(t *testing.T) {
 	}
 }
 
-func TestPrivateDestinationsNeedExplicitEntry(t *testing.T) {
+func TestPrivateDestinationsNeedExplicitAddressEntry(t *testing.T) {
 	p, addr := testProxy(t, "192.168.1.20")
 	p.SetPolicy("7", Policy{Mode: ModeOpen, Allow: []string{"*.lan"}})
 	if code, _ := connect(t, addr, "nas.lan:443", auth(p, "7")); code != 403 {
 		t.Fatalf("open mode + wildcard reached a LAN address: %d", code)
 	}
+	// An exact name is not enough either: its DNS answer is not the owner's
+	// statement about the address (rebinding).
 	p.SetPolicy("7", Policy{Mode: ModeAllowlist, Allow: []string{"nas.lan:443"}})
-	if code, _ := connect(t, addr, "nas.lan:443", auth(p, "7")); code != 200 {
-		t.Fatalf("explicit entry: %d", code)
+	if code, _ := connect(t, addr, "nas.lan:443", auth(p, "7")); code != 403 {
+		t.Fatalf("exact name reached a LAN address: %d", code)
 	}
-	if code, _ := connect(t, addr, "169.254.169.254:80", auth(p, "7")); code != 403 {
-		t.Fatalf("link-local metadata address: %d", code)
+	p.SetPolicy("7", Policy{Mode: ModeOpen, Allow: []string{"192.168.1.0/24:443", "10.0.0.5"}})
+	for target, want := range map[string]int{
+		"192.168.1.20:443": 200, "192.168.1.20:22": 403, "10.0.0.5:5432": 200, "10.0.0.6:5432": 403,
+		"169.254.169.254:80": 403, "[fd00::1]:443": 403, "100.64.0.1:443": 403,
+	} {
+		if code, _ := connect(t, addr, target, auth(p, "7")); code != want {
+			t.Errorf("%s: %d, want %d", target, code, want)
+		}
+	}
+}
+
+func TestPrivateDestinationsAreNeverPrompted(t *testing.T) {
+	p, addr := testProxy(t, "10.0.0.9")
+	s := &fakeSender{alive: true}
+	s.onSend = func(m map[string]any) {
+		if m["type"] == "egress.request" {
+			p.Decide("7", m["request_id"].(string), DecisionAllowProject, "")
+		}
+	}
+	p.SetSender(s)
+	p.SetPolicy("7", Policy{Mode: ModeAllowlist})
+	if code, _ := connect(t, addr, "10.0.0.9:443", auth(p, "7")); code != 403 {
+		t.Fatalf("private literal: %d", code)
+	}
+	// A name the owner approves in a prompt still reaches public addresses only.
+	if code, _ := connect(t, addr, "rebind.example.com:443", auth(p, "7")); code != 403 {
+		t.Fatalf("prompt-approved name reached a private address: %d", code)
+	}
+	if n := len(s.ofType("egress.request")); n != 1 {
+		t.Fatalf("got %d prompts, want 1 (only the name)", n)
+	}
+	if pol, _ := p.Policy("7"); !pol.Allows("rebind.example.com", 443) {
+		t.Fatal("allow_project not applied")
 	}
 }
 

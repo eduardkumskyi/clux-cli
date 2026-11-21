@@ -28,8 +28,9 @@ const (
 	// ModeAllowlist allows only hosts matching Allow; anything else is held
 	// for an owner decision.
 	ModeAllowlist Mode = "allowlist"
-	// ModeOpen allows any public host. Loopback and private addresses still
-	// need an explicit entry (see Policy.permits).
+	// ModeOpen allows any public host: the internet, not the owner's LAN.
+	// Private addresses still need an explicit IP/CIDR entry (see
+	// Policy.allowsPrivateIP); loopback is never reachable.
 	ModeOpen Mode = "open"
 )
 
@@ -77,16 +78,29 @@ func (p Policy) Allows(host string, port int) bool {
 	return p.Mode == ModeOpen
 }
 
-// listsExactly reports whether host is named by a non-wildcard entry. Only
-// such an entry may open a private/LAN destination: a wildcard or "open"
-// mode is meant for the internet, not the owner's network.
-func (p Policy) listsExactly(host string, port int) bool {
-	host = NormalizeHost(host)
+// allowsPrivateIP reports whether ip:port is covered by an IP or CIDR entry
+// ("10.0.0.5", "192.168.1.0/24:5432", "[fd00::1]:443"). Only such entries,
+// written by the owner, open a private/LAN/link-local destination: a host
+// name -- exact or wildcard, listed, approved in a prompt or added with
+// allow_project -- and "open" mode only ever reach public addresses, so a
+// DNS answer (rebinding) can never point the agent at the owner's network.
+func (p Policy) allowsPrivateIP(ip net.IP, port int) bool {
 	for _, pat := range p.Allow {
-		if strings.HasPrefix(strings.TrimSpace(pat), "*") {
+		h := strings.ToLower(strings.TrimSpace(pat))
+		if ph, pp, ok := splitPatternPort(h); ok {
+			if pp != port {
+				continue
+			}
+			h = ph
+		}
+		h = strings.Trim(h, "[]")
+		if e := net.ParseIP(h); e != nil {
+			if e.Equal(ip) {
+				return true
+			}
 			continue
 		}
-		if matchPattern(pat, host, port) {
+		if _, n, err := net.ParseCIDR(h); err == nil && n.Contains(ip) {
 			return true
 		}
 	}
@@ -106,8 +120,9 @@ func (p Policy) with(host string) Policy {
 }
 
 // matchPattern matches one allow entry: "example.com" (exact),
-// "*.example.com" (any subdomain, at any depth, but not the apex), either
-// optionally with ":port". Entries without a port match every port.
+// "*.example.com" (any subdomain, at any depth, but not the apex), an IP
+// literal or a CIDR ("10.0.0.0/8"), each optionally with ":port" (IPv6 in
+// brackets). Entries without a port match every port.
 func matchPattern(pattern, host string, port int) bool {
 	pattern = strings.ToLower(strings.TrimSpace(pattern))
 	if pattern == "" {
@@ -120,6 +135,10 @@ func matchPattern(pattern, host string, port int) bool {
 		pattern = h
 	}
 	pattern = strings.TrimSuffix(strings.Trim(pattern, "[]"), ".")
+	if _, n, err := net.ParseCIDR(pattern); err == nil {
+		ip := net.ParseIP(host)
+		return ip != nil && n.Contains(ip)
+	}
 	if strings.HasPrefix(pattern, "*.") {
 		suffix := pattern[1:] // ".example.com"
 		return len(host) > len(suffix) && strings.HasSuffix(host, suffix)

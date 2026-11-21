@@ -510,6 +510,12 @@ func (p *Proxy) serveHTTP(ctx context.Context, c net.Conn, req *http.Request, id
 // admit decides whether workspace id may reach host:port, asking the owner
 // if needed, and returns the vetted address to dial (never re-resolved, so
 // DNS can't swap in a loopback/LAN address after the check).
+//
+// Names only ever reach public addresses, whatever made them allowed (the
+// project list, "open" mode, a prompt, allow_project). A private, LAN,
+// link-local (cloud metadata) or CGNAT address is reachable only as an IP
+// literal covered by an owner-written IP/CIDR entry; such destinations are
+// never offered in a prompt. Loopback is never reachable.
 func (p *Proxy) admit(ctx context.Context, id, rawHost string, port int) (string, error) {
 	host := NormalizeHost(rawHost)
 	if host == "" || port < 1 || port > 65535 {
@@ -519,40 +525,37 @@ func (p *Proxy) admit(ctx context.Context, id, rawHost string, port int) (string
 	if !known {
 		return "", errors.New("unknown workspace")
 	}
+	literal := net.ParseIP(host)
+	if literal != nil && !isPublic(literal) {
+		if literal.IsLoopback() || literal.IsUnspecified() {
+			return "", errors.New("loopback is never reachable (that is the owner's own machine)")
+		}
+		if !pol.allowsPrivateIP(literal, port) {
+			return "", errors.New("private/LAN address: needs an explicit IP or CIDR entry in the project's egress allow list")
+		}
+		return net.JoinHostPort(literal.String(), strconv.Itoa(port)), nil
+	}
 	if !pol.Allows(host, port) {
 		decision := p.ask(ctx, id, host, port)
 		if decision != DecisionAllowOnce && decision != DecisionAllowProject {
 			return "", errors.New("not on the allow list")
 		}
-		pol, _ = p.Policy(id)
-		if decision == DecisionAllowOnce {
-			// allow_once covers exactly this destination; it may still only be
-			// a LAN address if the owner named it explicitly.
-			pol = Policy{Mode: pol.Mode, Allow: append(append([]string(nil), pol.Allow...), host)}
-		}
 	}
-	var ips []net.IP
-	if ip := net.ParseIP(host); ip != nil {
-		ips = []net.IP{ip}
-	} else {
-		lctx, cancel := context.WithTimeout(ctx, upstreamTimeout)
-		var err error
-		ips, err = p.lookup(lctx, host)
-		cancel()
-		if err != nil {
-			return "", fmt.Errorf("resolving: %w", err)
-		}
+	if literal != nil {
+		return net.JoinHostPort(literal.String(), strconv.Itoa(port)), nil
+	}
+	lctx, cancel := context.WithTimeout(ctx, upstreamTimeout)
+	ips, err := p.lookup(lctx, host)
+	cancel()
+	if err != nil {
+		return "", fmt.Errorf("resolving: %w", err)
 	}
 	for _, ip := range ips {
-		if ip.IsLoopback() || ip.IsUnspecified() {
-			continue // never: that is the owner's own machine
+		if isPublic(ip) {
+			return net.JoinHostPort(ip.String(), strconv.Itoa(port)), nil
 		}
-		if !isPublic(ip) && !pol.listsExactly(host, port) {
-			continue
-		}
-		return net.JoinHostPort(ip.String(), strconv.Itoa(port)), nil
 	}
-	return "", errors.New("resolves only to local or private addresses")
+	return "", errors.New("resolves only to local or private addresses (host names reach public addresses only; use an IP/CIDR entry for LAN hosts)")
 }
 
 // ask sends one egress.request (shared by concurrent connections to the
@@ -723,6 +726,18 @@ var (
 	reserved  = mustCIDR("240.0.0.0/4")
 	thisNet   = mustCIDR("0.0.0.0/8")
 	ietf      = mustCIDR("192.0.0.0/24")
+
+	// IPv6 ranges that embed an IPv4 address (NAT64, 6to4) are judged by
+	// that address; the others are never globally routable unicast.
+	nat64   = mustCIDR("64:ff9b::/96")
+	sixTo4  = mustCIDR("2002::/16")
+	special = []*net.IPNet{
+		mustCIDR("64:ff9b:1::/48"), // local-use NAT64
+		mustCIDR("100::/64"),       // discard-only
+		mustCIDR("2001::/23"),      // IETF protocol assignments (incl. Teredo)
+		mustCIDR("2001:db8::/32"),  // documentation
+		mustCIDR("fec0::/10"),      // deprecated site-local
+	}
 )
 
 func mustCIDR(s string) *net.IPNet {
@@ -744,6 +759,18 @@ func isPublic(ip net.IP) bool {
 			if n.Contains(v4) {
 				return false
 			}
+		}
+		return true
+	}
+	if nat64.Contains(ip) {
+		return isPublic(net.IP(ip[12:16]))
+	}
+	if sixTo4.Contains(ip) {
+		return isPublic(net.IP(ip[2:6]))
+	}
+	for _, n := range special {
+		if n.Contains(ip) {
+			return false
 		}
 	}
 	return true
