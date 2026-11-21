@@ -82,4 +82,28 @@ func TestSandboxProfileEnforced(t *testing.T) {
 	if run("/bin/ls", home0) == nil {
 		t.Fatal("owner home listable")
 	}
+	// No setuid/setgid bits from inside, and no exec of a setuid file (the
+	// kernel's own rule for sandboxed processes).
+	bin := filepath.Join(ws, "tool")
+	if b, err := os.ReadFile("/usr/bin/true"); err == nil {
+		os.WriteFile(bin, b, 0o755)
+	}
+	if run("/bin/chmod", "u+s", bin) == nil {
+		t.Fatal("chmod u+s allowed in the sandbox")
+	}
+	if st, _ := os.Stat(bin); st != nil && st.Mode()&os.ModeSetuid != 0 {
+		t.Fatal("the sandbox set a setuid bit")
+	}
+	if run("/bin/chmod", "755", bin) != nil {
+		t.Fatal("plain chmod denied")
+	}
+	if run(bin) != nil {
+		t.Fatal("the plain copy does not run in the sandbox")
+	}
+	os.Chmod(bin, 0o755|os.ModeSetuid) // outside the sandbox: the owner may
+	if st, _ := os.Stat(bin); st != nil && st.Mode()&os.ModeSetuid != 0 {
+		if run(bin) == nil {
+			t.Fatal("a sandboxed process executed a setuid file")
+		}
+	}
 }

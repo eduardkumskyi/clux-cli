@@ -162,6 +162,12 @@ func SandboxProfile(p ProfileParams) (string, error) {
 (deny network-outbound (literal "/private/var/run/mDNSResponder"))
 `)
 
+	b.WriteString(`
+;; no setuid/setgid bits: a slot's setuid file, run by another slot's code
+;; outside Seatbelt, would hand out this slot's uid (the kernel already
+;; refuses sandboxed processes to exec setuid/setgid files at all)
+(deny file-write-setugid)
+`)
 	b.WriteString("\n;; no git hooks: a hook planted in a repo would run on the next git command\n")
 	fmt.Fprintf(&b, "(deny file-write* (regex #\"^%s/(.*/)?\\.git/hooks(/|$)\"))\n", regexp.QuoteMeta(p.WorkspaceDir))
 	return b.String(), nil

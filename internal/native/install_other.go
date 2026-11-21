@@ -25,6 +25,9 @@ const OwnerSlotMapFile = ".clux/native-slots.json"
 // KillUID is macOS-only.
 func KillUID(uid, except int) int { return 0 }
 
+// KillIDs is macOS-only.
+func KillIDs(uid, gid, except int) int { return 0 }
+
 // UninstallOptions configures Uninstall (macOS only).
 type UninstallOptions struct {
 	Purge bool

@@ -224,7 +224,7 @@ func TestKillAllStopsThenKillsUntilEmpty(t *testing.T) {
 		}
 		return nil
 	}
-	n := killAll(list, kill, 7, 10, time.Millisecond)
+	n := killAll(list, func(pid int) bool { return alive[pid] }, kill, 7, 10, time.Millisecond)
 	if alive[100] || alive[101] || alive[102] {
 		t.Fatalf("survivors: %v", alive)
 	}

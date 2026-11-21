@@ -291,6 +291,7 @@ func TestSandboxProfileContents(t *testing.T) {
 		`(deny file-write* (regex #"^/private/var/clux/slots/2/workspaces/12/(.*/)?\.git/hooks(/|$)"))`,
 		`(deny mach-lookup (global-name "com.apple.dnssd.service"))`,
 		`(deny network-outbound (literal "/private/var/run/mDNSResponder"))`,
+		`(deny file-write-setugid)`,
 	} {
 		if !strings.Contains(p, want) {
 			t.Errorf("profile lacks %s", want)

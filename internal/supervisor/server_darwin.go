@@ -57,7 +57,7 @@ type Options struct {
 	// the slot user (default: `xcrun simctl shutdown all`); tests fake it.
 	ShutdownSimulators func(ctx context.Context) error
 	// KillSlot kills every other process of the slot user (default:
-	// native.KillUID on this uid; with SkipUIDCheck, i.e. in tests, it
+	// native.KillIDs on this uid and gid; with SkipUIDCheck, i.e. in tests, it
 	// defaults to doing nothing -- the test user's processes are not a
 	// slot's).
 	KillSlot func() int
@@ -136,7 +136,7 @@ func NewServer(opts Options) (*Server, error) {
 		if opts.SkipUIDCheck {
 			opts.KillSlot = func() int { return 0 }
 		} else {
-			opts.KillSlot = func() int { return native.KillUID(os.Getuid(), os.Getpid()) }
+			opts.KillSlot = func() int { return native.KillIDs(os.Getuid(), os.Getgid(), os.Getpid()) }
 		}
 	}
 	if opts.PFCheck == nil {

@@ -146,36 +146,83 @@ func pickProxyPort() (int, error) {
 	return 0, fmt.Errorf("no free port for the egress proxy near %d", DefaultProxyPort)
 }
 
-// killUser kills every process of uid (as root: uninstall, slot removal).
-func killUser(uid int) { KillUID(uid, -1) }
+// killUser kills every process holding uid (as root: uninstall, slot removal).
+func killUser(uid int) { KillIDs(uid, -1, -1) }
 
-// KillUID kills every process whose real or effective uid is uid, except
-// pid except (a supervisor clearing its own slot passes its pid). Each round
-// first stops everything it sees, then kills it, so a process can't escape
-// by forking faster than the sweep; rounds repeat until nothing is left.
-// Returns how many processes were signalled.
-func KillUID(uid, except int) int {
-	list := func() []int {
-		seen := map[int]bool{}
-		var pids []int
-		for _, name := range []string{"kern.proc.uid", "kern.proc.ruid"} {
-			procs, err := unix.SysctlKinfoProcSlice(name, uid)
-			if err != nil {
-				continue
-			}
-			for _, p := range procs {
-				if pid := int(p.Proc.P_pid); !seen[pid] {
-					seen[pid] = true
-					pids = append(pids, pid)
-				}
-			}
-		}
-		return pids
+// KillUID kills every process holding uid (see KillIDs), except pid except.
+func KillUID(uid, except int) int { return KillIDs(uid, -1, except) }
+
+// holdsIDs reports whether a process holds uid as its real, effective or
+// saved uid, or gid as its real, effective, saved or a supplementary gid.
+// The saved ids matter: a process of another user that ran a setuid file of
+// uid keeps uid as its saved uid after seteuid() back to its own, can
+// switch to it again at any time, and is invisible to kern.proc.uid/ruid.
+// gid < 0 (or outside the slot id range) matches no gid.
+func holdsIDs(p *unix.KinfoProc, uid, gid int) bool {
+	pc, uc := &p.Eproc.Pcred, &p.Eproc.Ucred
+	if uid >= 0 && (int(pc.P_ruid) == uid || int(pc.P_svuid) == uid || int(uc.Uid) == uid) {
+		return true
 	}
-	return killAll(list, syscall.Kill, except, 10, 100*time.Millisecond)
+	if gid < 0 || !inIDRange(gid) {
+		return false
+	}
+	if int(pc.P_rgid) == gid || int(pc.P_svgid) == gid {
+		return true
+	}
+	n := int(uc.Ngroups) // cr_groups[0] is the effective gid
+	if n > len(uc.Groups) {
+		n = len(uc.Groups)
+	}
+	for _, g := range uc.Groups[:n] {
+		if int(g) == gid {
+			return true
+		}
+	}
+	return false
 }
 
-func killAll(list func() []int, kill func(int, syscall.Signal) error, except, rounds int, pause time.Duration) int {
+const szomb = 5 // SZOMB in <sys/proc.h>
+
+// pidsHolding scans every process (kern.proc.all) for those holding uid or
+// gid (holdsIDs).
+func pidsHolding(uid, gid int) []int {
+	procs, err := unix.SysctlKinfoProcSlice("kern.proc.all")
+	if err != nil {
+		return nil
+	}
+	var pids []int
+	for i := range procs {
+		// A zombie can't run any more (and only its parent can reap it).
+		if procs[i].Proc.P_stat != szomb && holdsIDs(&procs[i], uid, gid) {
+			pids = append(pids, int(procs[i].Proc.P_pid))
+		}
+	}
+	return pids
+}
+
+// pidHolds re-reads one process: does pid (still) hold uid or gid?
+func pidHolds(pid, uid, gid int) bool {
+	p, err := unix.SysctlKinfoProc("kern.proc.pid", pid)
+	if err != nil || int(p.Proc.P_pid) != pid {
+		return false
+	}
+	return holdsIDs(p, uid, gid)
+}
+
+// KillIDs kills every process that holds uid or gid as a real, effective,
+// saved (or supplementary) id, except pid except (a supervisor clearing its
+// own slot passes its pid). Each round first stops everything it sees, then
+// kills what still holds the ids (a pid may have been reused between the
+// listing and the signal), so a process can't escape by forking faster than
+// the sweep; rounds repeat until nothing is left. Returns how many
+// processes were signalled.
+func KillIDs(uid, gid, except int) int {
+	return killAll(func() []int { return pidsHolding(uid, gid) },
+		func(pid int) bool { return pidHolds(pid, uid, gid) },
+		syscall.Kill, except, 10, 100*time.Millisecond)
+}
+
+func killAll(list func() []int, still func(int) bool, kill func(int, syscall.Signal) error, except, rounds int, pause time.Duration) int {
 	total := 0
 	for i := 0; i < rounds; i++ {
 		var pids []int
@@ -191,6 +238,12 @@ func killAll(list func() []int, kill func(int, syscall.Signal) error, except, ro
 			_ = kill(pid, syscall.SIGSTOP)
 		}
 		for _, pid := range pids {
+			if !still(pid) {
+				// Reused by another process after the listing: we stopped
+				// an innocent one; let it go on.
+				_ = kill(pid, syscall.SIGCONT)
+				continue
+			}
 			if kill(pid, syscall.SIGKILL) == nil {
 				total++
 			}

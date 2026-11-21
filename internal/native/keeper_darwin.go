@@ -41,6 +41,7 @@ type keeper struct {
 	stateUID, stateGID int
 	wipe               func(ctx context.Context, s Slot) (int64, error)
 	resident           func(n int) []string
+	prepare            func(s Slot) error
 
 	slots map[int]*sync.Mutex // held while a slot's state changes (wipe: minutes)
 }
@@ -49,6 +50,7 @@ func newKeeper(cfg *Config, logf func(string, ...any)) (*keeper, error) {
 	k := &keeper{cfg: cfg, logf: logf, stateDir: StateDir, slots: map[int]*sync.Mutex{}}
 	k.wipe = k.wipeSlot
 	k.resident = slotResident
+	k.prepare = prepareSlot
 	for _, s := range cfg.Slots {
 		k.slots[s.N] = &sync.Mutex{}
 	}
@@ -148,6 +150,12 @@ func (k *keeper) dispatch(ctx context.Context, req KeeperRequest) KeeperResponse
 			return KeeperResponse{Error: err.Error(), State: &st}
 		}
 		if next != st {
+			// Handing the slot out: its home is the uid's alone, and no
+			// other user's process may still hold the uid.
+			if err := k.prepare(s); err != nil {
+				k.logf("slot keeper: preparing slot %d for workspace %s: %v", s.N, req.WorkspaceID, err)
+				return KeeperResponse{Error: fmt.Sprintf("preparing slot %d: %v", s.N, err), State: &st}
+			}
 			if err := k.save(next); err != nil {
 				return KeeperResponse{Error: err.Error()}
 			}
@@ -266,12 +274,15 @@ func slotResident(n int) []string {
 //  2. scheduled jobs that would start the uid again later: its crontab and
 //     at jobs;
 //  3. booted simulators are shut down, then the uid's launchd user and gui
-//     domains are booted out and every process of the uid is killed, again
-//     and again until none is left (launchd respawns user-domain services);
+//     domains are booted out and every process holding the uid or gid
+//     (real, effective or saved: also another slot's process that ran a
+//     setuid file of this one) is killed, again and again until none is
+//     left (launchd respawns user-domain services);
 //  4. the home is renamed aside inside root-owned SlotsDir (nothing of the
 //     uid can reach it any more), replaced by a fresh empty one and deleted;
 //     the uid's per-user temp/cache dirs are emptied and its files in the
-//     shared temp dirs deleted;
+//     shared temp dirs deleted; no setuid/setgid file of any slot is left
+//     where a slot can reach it (sweepSlotSetugid);
 //  5. nothing of the uid may have reappeared; the supervisor is started
 //     again.
 func (k *keeper) wipeSlot(ctx context.Context, s Slot) (int64, error) {
@@ -287,7 +298,7 @@ func (k *keeper) wipeSlot(ctx context.Context, s Slot) (int64, error) {
 	}
 	purgeScheduled(s, k.logf)
 	shutdownSimulatorsAs(ctx, s, k.logf)
-	if err := killUIDCompletely(s.UID); err != nil {
+	if err := killUIDCompletely(s.UID, s.GID); err != nil {
 		return 0, err
 	}
 
@@ -310,14 +321,84 @@ func (k *keeper) wipeSlot(ctx context.Context, s Slot) (int64, error) {
 		emptyDir(d, k.logf)
 	}
 	removeSharedFiles(s.UID, k.logf)
+	// No setuid/setgid file of a slot may hand this uid (or any slot's)
+	// out again: hard links in other slots' homes, copies anywhere.
+	sweepSlotSetugid(k.cfg, k.logf)
 
-	if err := killUIDCompletely(s.UID); err != nil {
+	if err := killUIDCompletely(s.UID, s.GID); err != nil {
 		return freed, err
 	}
 	if err := startSupervisor(s); err != nil {
 		return freed, err
 	}
 	return freed, nil
+}
+
+// prepareSlot runs (as root) right before a slot is handed to a workspace:
+//   - the home is reset to mode 0700 without ACL entries, so no other slot
+//     can search it, whatever the previous holder did to it;
+//   - any process holding the slot's uid or gid that is not purely the slot
+//     user (another user that ran a setuid/setgid file of the slot and kept
+//     the id as its effective or saved id) is killed. After a wipe nothing
+//     like it can exist (the wipe kills every holder and strips every slot
+//     setuid/setgid file); this is the check that it really doesn't.
+func prepareSlot(s Slot) error {
+	if !inIDRange(s.UID) {
+		return fmt.Errorf("uid %d outside the slot range", s.UID)
+	}
+	p, err := inTrustedDir(SlotHome(s.N))
+	if err != nil {
+		return err
+	}
+	fd, err := unix.Open(p, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return fmt.Errorf("home %s: %w", p, err)
+	}
+	defer unix.Close(fd)
+	var st unix.Stat_t
+	if err := unix.Fstat(fd, &st); err != nil {
+		return err
+	}
+	if int(st.Uid) != s.UID {
+		return fmt.Errorf("home %s is owned by uid %d, not %d", p, st.Uid, s.UID)
+	}
+	// The entry is in a root-owned directory: the path still names fd.
+	if out, err := run("/bin/chmod", "-N", p); err != nil {
+		return fmt.Errorf("clearing the ACL of %s: %v %s", p, err, out)
+	}
+	if err := unix.Fchmod(fd, 0o700); err != nil {
+		return fmt.Errorf("chmod 0700 %s: %w", p, err)
+	}
+	impostors := func() []int { return impostorPIDs(s.UID, s.GID) }
+	for i := 0; i < 5 && len(impostors()) > 0; i++ {
+		killAll(impostors, func(pid int) bool { return containsInt(impostorPIDs(s.UID, s.GID), pid) },
+			syscall.Kill, -1, 10, 50*time.Millisecond)
+	}
+	if left := impostors(); len(left) > 0 {
+		return fmt.Errorf("processes of other users keep holding uid %d: %v", s.UID, left)
+	}
+	return nil
+}
+
+// impostorPIDs lists the processes holding uid/gid whose real, effective
+// and saved uids are not all uid.
+func impostorPIDs(uid, gid int) []int {
+	procs, err := unix.SysctlKinfoProcSlice("kern.proc.all")
+	if err != nil {
+		return nil
+	}
+	var pids []int
+	for i := range procs {
+		p := &procs[i]
+		if p.Proc.P_stat == szomb || !holdsIDs(p, uid, gid) || int(p.Proc.P_pid) <= 1 {
+			continue
+		}
+		pc := &p.Eproc.Pcred
+		if int(pc.P_ruid) != uid || int(pc.P_svuid) != uid || int(p.Eproc.Ucred.Uid) != uid {
+			pids = append(pids, int(p.Proc.P_pid))
+		}
+	}
+	return pids
 }
 
 // purgeUID is what removing a slot (shrinking, uninstall) needs: the
@@ -328,7 +409,7 @@ func purgeUID(s Slot, logf func(string, ...any)) {
 		return
 	}
 	purgeScheduled(s, logf)
-	if err := killUIDCompletely(s.UID); err != nil {
+	if err := killUIDCompletely(s.UID, s.GID); err != nil {
 		logf("%v", err)
 	}
 }
@@ -354,39 +435,32 @@ func purgeScheduled(s Slot, logf func(string, ...any)) {
 	}
 }
 
-// killUIDCompletely boots out the uid's launchd domains and kills its
-// processes until none is left for a while; launchd may respawn
+// killUIDCompletely boots out the uid's launchd domains and kills every
+// process holding the uid or gid (real, effective or saved id; see
+// holdsIDs) until none is left for a while; launchd may respawn
 // user-domain services right after a kill.
-func killUIDCompletely(uid int) error {
+func killUIDCompletely(uid, gid int) error {
 	for round := 0; round < 15; round++ {
 		_, _ = run("/bin/launchctl", "bootout", "user/"+strconv.Itoa(uid))
 		_, _ = run("/bin/launchctl", "bootout", "gui/"+strconv.Itoa(uid))
-		KillUID(uid, -1)
+		KillIDs(uid, gid, -1)
 		time.Sleep(300 * time.Millisecond)
-		if len(uidPIDs(uid)) == 0 {
+		if len(slotPIDs(uid, gid)) == 0 {
 			time.Sleep(700 * time.Millisecond)
-			if len(uidPIDs(uid)) == 0 {
+			if len(slotPIDs(uid, gid)) == 0 {
 				return nil
 			}
 		}
 	}
-	return fmt.Errorf("processes of uid %d keep coming back: %v", uid, uidPIDs(uid))
+	return fmt.Errorf("processes holding uid %d / gid %d keep coming back: %v", uid, gid, slotPIDs(uid, gid))
 }
 
-// uidPIDs lists the processes whose effective or real uid is uid.
-func uidPIDs(uid int) []int {
-	seen := map[int]bool{}
+// slotPIDs lists the processes (other than launchd) holding uid or gid.
+func slotPIDs(uid, gid int) []int {
 	var pids []int
-	for _, name := range []string{"kern.proc.uid", "kern.proc.ruid"} {
-		procs, err := unix.SysctlKinfoProcSlice(name, uid)
-		if err != nil {
-			continue
-		}
-		for _, p := range procs {
-			if pid := int(p.Proc.P_pid); pid > 1 && !seen[pid] {
-				seen[pid] = true
-				pids = append(pids, pid)
-			}
+	for _, pid := range pidsHolding(uid, gid) {
+		if pid > 1 {
+			pids = append(pids, pid)
 		}
 	}
 	return pids
@@ -505,7 +579,7 @@ func treeSize(root string) int64 {
 // sharedTempDirs are the world-writable places a slot could leave files
 // in outside its home (Seatbelt confines the agent, but code it starts
 // outside Seatbelt -- simulator apps -- is not).
-var sharedTempDirs = []string{"/private/tmp", "/private/var/tmp", "/Users/Shared"}
+var sharedTempDirs = []string{"/private/tmp", "/private/var/tmp", "/Users/Shared", "/cores"}
 
 // removeSharedFiles deletes the uid's files and empty directories in the
 // shared temp dirs. find(1) walks physically (-P, the default) and on one

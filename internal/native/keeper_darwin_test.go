@@ -61,6 +61,7 @@ func newTestKeeper(t *testing.T, owner int) *testKeeper {
 	k.stateUID, k.stateGID = os.Getuid(), os.Getgid()
 	os.Mkdir(k.stateDir, 0o755)
 	k.resident = func(n int) []string { return tk.res[n] }
+	k.prepare = func(Slot) error { return nil }
 	k.wipe = func(ctx context.Context, s Slot) (int64, error) {
 		if tk.block != nil {
 			<-tk.block
