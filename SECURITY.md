@@ -54,13 +54,39 @@ or kill it, and the supervisor's own cleanup is not what the reuse relies
 on. Delete goes to the root keeper instead, which boots out the
 supervisor, removes the uid's crontab and at jobs, shuts down its
 simulators, boots out its launchd `user/` and `gui/` domains and kills
-every process of the uid until none comes back, moves the home aside
-(inside the root-owned slots directory) and deletes it, empties the uid's
-`/private/var/folders` dir, deletes its files in `/private/tmp`,
-`/private/var/tmp` and `/Users/Shared`, and then records the slot clean in a
-root-owned state file. The host only hands out slots root reports clean
-(or has root wipe them first), and a supervisor refuses to start a
-workspace root has not recorded as the slot's holder.
+every process holding the slot's uid or gid as its real, effective or
+saved id (all processes are scanned, so a process of another slot that
+ran a setuid file of this one and dropped back with `seteuid()` dies too)
+until none comes back, moves the home aside (inside the root-owned slots
+directory) and deletes it, empties the uid's `/private/var/folders` dir,
+deletes its files in `/private/tmp`, `/private/var/tmp`, `/Users/Shared`
+and `/cores`, clears the setuid/setgid bits of every file of any slot
+uid/gid that a slot can reach (below), and then records the slot clean in
+a root-owned state file. The host only hands out slots root reports clean
+(or has root wipe them first); handing one out, root resets the home to
+0700 without ACL entries and kills any process of another user still
+holding the slot's uid; and a supervisor refuses to start a workspace root
+has not recorded as the slot's holder.
+
+Setuid/setgid files: Seatbelt denies setting the bits
+(`file-write-setugid`), and the kernel refuses sandboxed processes to
+exec a setuid/setgid file at all, but simulator apps run outside Seatbelt
+and can `chmod u+s` their own files anywhere they can write, and another
+slot's unsandboxed code could run them or hard-link them into its own
+home to keep for later. So the wipe walks every local writable file
+system that honours setuid bits (not just a list of temp dirs: third-party
+apps leave world-writable directories around), descending only into
+directories a slot user can search and looking at files only in
+directories a slot user can write, never following links (`openat` with
+`O_NOFOLLOW` from the parent's descriptor; the bits are cleared through
+the file's own descriptor). A second pass over just the trees a slot can
+write runs with every slot process stopped (SIGSTOP, resumed right after;
+measured on a dev Mac: ~0.7 s stopped, ~24 s for the whole sweep), so no slot
+can move a file out of the walk's way. A nosuid APFS volume for the slot
+homes was considered and not used: `/private/tmp`, the per-user
+`/private/var/folders` dirs and other world-writable places stay on the
+Data volume (which can't be nosuid without breaking the Mac), so it would
+not remove the need for the sweep.
 
 Root never acts on paths an agent (or the owner) can write while it can
 still act: it creates and re-owns only entries of root-owned directories,
@@ -127,9 +153,11 @@ Further known limits (by design or documented, not vulnerabilities):
   process of the slot uid (done by the supervisor, so a hostile workspace
   can keep its own leftovers alive until delete). Delete is root's wipe
   above. Not covered by the wipe: System V IPC objects and launchd
-  enable/disable overrides of the uid, and files the uid owns in other
-  world-writable places than the three listed (none can run code by
-  themselves).
+  enable/disable overrides of the uid, and non-setuid files the uid owns
+  in other world-writable places than the ones listed (none can run code
+  by themselves or carry the uid). The setuid sweep trusts POSIX
+  permission bits: a directory a slot can reach only through an ACL entry
+  granted by its (non-slot) owner is not walked.
 
 In scope for reports: anything that lets workspace code read or write the
 owner's files or another workspace's files, processes or secrets, talk to
