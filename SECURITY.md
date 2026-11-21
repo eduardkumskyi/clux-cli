@@ -32,38 +32,62 @@ host to run containers" is the documented design, not a vulnerability.
 ## Native macOS runtime
 
 `sudo clux native install` (opt-in, macOS) adds a root LaunchDaemon
-(`clux native pfd`: pf anchor `com.apple/clux` + its pf enable token) and
-one LaunchDaemon per *slot*: a pool of hidden agent users `_clux1`..`_cluxN`
-(own primary groups, not in `staff`/`admin`, homes
+(`clux native pfd`: pf anchor `com.apple/clux` + its pf enable token, and
+the *slot keeper*) and one LaunchDaemon per *slot*: a pool of hidden agent
+users `_clux1`..`_cluxN` (own primary groups, not in `staff`/`admin`, homes
 `/private/var/clux/slots/<n>` 0700), each running `clux native supervise
---slot n` with a unix socket only the installing owner may use (0660 in a
-`_cluxN:_cluxctl` 0750 directory, plus a peer-uid check; the owner's client
-in turn checks the socket is served by the slot's uid). All daemons run a
-root-owned copy of the binary in a directory whose whole parent chain is
-root-owned and not group/world-writable. Each workspace holds one slot for
-its whole life and runs as that slot's uid; its network is forced through
-the egress proxy in `clux host start`.
+--slot n`. The supervisor starts as root, binds its unix socket in a
+`root:_cluxctl` 0750 directory the slot user can't enter (socket
+`root:_cluxctl` 0660), then drops to the slot user for good. The
+supervisor and the keeper check the peer uid against the installing owner;
+the owner's clients check that the socket was created by root (root-only
+directory chain, root-owned socket, listen-time peer credentials uid 0),
+which a slot user can't fake. All daemons run a root-owned copy of the
+binary in a directory whose whole parent chain is root-owned and not
+group/world-writable. A workspace holds one slot for its whole life and
+runs as that slot's uid; its TCP/UDP is forced through the egress proxy in
+`clux host start`.
 
-Root never acts on paths an agent (or the owner) can write: it creates and
-re-owns only entries of root-owned directories, opened with `O_NOFOLLOW`
-(an existing entry that is a symlink, or owned by an unexpected uid, is
-refused); its files are written to random `O_EXCL|O_NOFOLLOW` temp names,
-owned/moded through the descriptor and renamed into place; slot homes are
-populated by the slot's own supervisor; files in the owner's home are
-read or removed with the owner's privileges. The pf daemon's state (status,
-enable token, effective rules) lives in the root-owned
-`/private/var/run/clux-native` and is only believed from root-owned files
-there.
+Slots are reused: after a workspace is deleted, the next workspace gets
+the same uid. The supervisor runs as that uid too, so the agent can stop
+or kill it, and the supervisor's own cleanup is not what the reuse relies
+on. Delete goes to the root keeper instead, which boots out the
+supervisor, removes the uid's crontab and at jobs, shuts down its
+simulators, boots out its launchd `user/` and `gui/` domains and kills
+every process of the uid until none comes back, moves the home aside
+(inside the root-owned slots directory) and deletes it, empties the uid's
+`/private/var/folders` dir, deletes its files in `/private/tmp`,
+`/private/var/tmp` and `/Users/Shared`, and then records the slot clean in a
+root-owned state file. The host only hands out slots root reports clean
+(or has root wipe them first), and a supervisor refuses to start a
+workspace root has not recorded as the slot's holder.
+
+Root never acts on paths an agent (or the owner) can write while it can
+still act: it creates and re-owns only entries of root-owned directories,
+opened with `O_NOFOLLOW` (an existing entry that is a symlink, or owned by
+an unexpected uid, is refused); its files are written to random
+`O_EXCL|O_NOFOLLOW` temp names, owned/moded through the descriptor and
+renamed into place; slot homes are populated by the slot's own supervisor
+and wiped by root only after every process of the uid is gone, by renaming
+them inside the root-owned parent first; files in the owner's home are
+read or removed with the owner's privileges. The pf daemon's state
+(status, enable token, effective rules, slot records) lives in root-owned
+directories and is only believed from root-owned files there.
 
 What we state to users (and treat as the security boundary):
 
-**Enforced by macOS (supported mechanisms):** each workspace runs as its own
-hidden user with no access to your home, files, Keychain, clipboard, apps or
-desktop, or to other workspaces' files, processes and environments; network
-leaves only through the clux proxy you control. **Extra layer:** Seatbelt
-sandbox (reported live). **Not covered:** macOS kernel/privilege-escalation
-vulnerabilities; world-readable files outside home (`/Users/Shared`,
-`/Applications`, `/opt/homebrew`); process names in `ps`.
+**Enforced by macOS (supported mechanisms):** each workspace runs as a
+hidden user of its own (no two existing workspaces share one; a deleted
+workspace's user is wiped by root before reuse) with no access to your
+home, files, Keychain, clipboard or desktop, or to other workspaces'
+files, processes and environments; its TCP and UDP traffic leaves only
+through the clux proxy you control, which refuses this Mac's own addresses
+and loopback. **Extra layer:** Seatbelt sandbox (reported live). **Not
+covered:** macOS kernel/privilege-escalation vulnerabilities; DNS and ICMP
+outside Seatbelt (below); world-readable files and apps outside home
+(`/Users/Shared`, `/Applications`, `/opt/homebrew`), which a workspace can
+read and run as its own user; process names in `ps`; a workspace stopping
+or killing its own supervisor (it only denies service to itself).
 
 Further known limits (by design or documented, not vulnerabilities):
 
@@ -85,21 +109,35 @@ Further known limits (by design or documented, not vulnerabilities):
   ICMP echo, a low-bandwidth covert channel to any host. Inside the sandbox
   ICMP is denied (verified). Like DNS above, this matters only in allow-list
   mode.
-- A slot user may connect to its own loopback listeners (pf allows each
+- A slot user may connect to its own loopback listeners (pf passes each
   port only while every listener on it belongs to that slot, refreshed
   every second by the root daemon); a new listener is unreachable for up to
-  ~1 s.
-- On stop/delete, the supervisor kills the workspace's process tree, shuts
-  down the slot's simulators, then kills every remaining process of the
-  slot uid. Delete also wipes the slot's home (Library, simulators,
-  keychains, caches) before the slot is reused.
+  ~1 s. Every passed port also has an inbound guard (`block in ... port P
+  user != <slot>`, matched per connection against the listener's owner), so
+  when a slot's port is released and rebound by someone else before the
+  next refresh, the slot's connection is refused, not delivered. The proxy
+  port is passed only while every listener on it is the owner's, with the
+  same kind of guard, so a slot that binds it while `clux host start` is
+  down can't collect other workspaces' proxy credentials. Connections
+  already established when a port leaves a slot's set keep their pf state
+  (macOS `pfctl` can't kill states by port, and killing all loopback states
+  would cut every live sidecar connection); they stay between the same two
+  sockets and can't reach a new listener.
+- Stop kills the workspace's process tree, its simulators and every other
+  process of the slot uid (done by the supervisor, so a hostile workspace
+  can keep its own leftovers alive until delete). Delete is root's wipe
+  above. Not covered by the wipe: System V IPC objects and launchd
+  enable/disable overrides of the uid, and files the uid owns in other
+  world-writable places than the three listed (none can run code by
+  themselves).
 
 In scope for reports: anything that lets workspace code read or write the
 owner's files or another workspace's files, processes or secrets, talk to
 the owner's localhost services, another workspace's listeners, private/LAN
 addresses or the network without going through the proxy's policy, drive a
-supervisor socket without being the owner, or gain root via the daemons or
-`clux native install`.
+supervisor or keeper socket without being the owner, receive what the owner
+sends a supervisor, survive a delete into the next workspace of its slot,
+or gain root via the daemons or `clux native install`.
 
 ## Reporting a vulnerability
 
