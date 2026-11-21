@@ -60,6 +60,21 @@ func Acquire(dir string) (*Lock, error) {
 	return &Lock{f: f, path: p}, nil
 }
 
+// Holder reports whether another process holds the lock in dir, and its
+// pid, without keeping it (`clux host status/stop`).
+func Holder(dir string) (pid int, held bool, err error) {
+	l, err := Acquire(dir)
+	if err != nil {
+		var h *ErrHeld
+		if errors.As(err, &h) {
+			return h.PID, true, nil
+		}
+		return 0, false, err
+	}
+	l.Release()
+	return 0, false, nil
+}
+
 // Release drops the lock.
 func (l *Lock) Release() {
 	if l == nil || l.f == nil {

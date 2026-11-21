@@ -30,14 +30,32 @@ go install github.com/eduardkumskyi/clux-cli/cmd/clux@latest
 ## Usage
 
 ```
-clux login --token <PAT>     # from the "Add a host" screen in the Clux dashboard
-clux doctor                  # sanity-check docker, credentials, connectivity
-clux host start               # register this machine and keep it online (foreground)
+clux host start      # connect this computer (confirm in the browser) and keep it online
+clux host status     # is it running, which host, which backend
+clux host logs -f    # follow ~/.clux/logs/host.log
+clux host stop       # stop the background service
 ```
 
-On a Mac, the first interactive `clux host start` offers to set up the
-native macOS runtime for iOS/Xcode workspaces (see *Native macOS runtime*);
-answer `Y` and enter your admin password once, or `n` to keep Docker only.
+The first `clux host start` in a terminal walks through everything once:
+
+1. **Connect.** Without stored credentials it prints a link and a code,
+   opens the browser, and waits while you confirm the code in the Clux app
+   (Ctrl+C cancels). `clux login` does the same on its own.
+2. **Native runtime (Mac).** Offers to set up the native macOS runtime for
+   iOS/Xcode workspaces (see *Native macOS runtime*).
+3. **Background.** Asks "Keep this computer online in the background
+   (starts when you log in)? [Y/n]". Yes installs a per-user service and
+   returns your terminal; no keeps it in the foreground as before. The answer
+   is remembered (`"service"` in `~/.clux/config.json`).
+
+**One computer = one host.** The CLI identifies the machine with a
+`machine_id` (a SHA-256 of the OS machine id and your OS user; the raw id is
+never sent), so logging in again on the same computer gets the same host
+back, with its projects, instead of a new one.
+
+Servers and CI without a browser: create a host in the dashboard and run
+`clux login --token <PAT>`, then `clux host start` (non-interactive runs
+never prompt and stay in the foreground).
 
 Run `clux help` for the full command list.
 
@@ -45,11 +63,14 @@ Run `clux help` for the full command list.
 
 | Command | Flags | Description |
 | --- | --- | --- |
-| `clux login` | `--token <PAT>` (required)<br>`--backend-url <url>` (default `https://api.clux.space`) | Verifies the token against the backend and stores credentials locally. |
-| `clux logout` | none | Removes stored credentials. |
+| `clux login` | `--token <PAT>` (optional)<br>`--backend-url <url>` (default `https://api.clux.space`, or the one stored before) | Without `--token`: browser login. Prints `To connect this computer, open: <url> and confirm the code ABCD-EFGH`, opens the browser (not over SSH), polls until you confirm, deny, or the code expires (10 min). On a computer that was connected before, the backend returns the same host. With `--token`: verifies the token by registering once. Either way it stores credentials in `~/.clux/config.json` and restarts the background service if it runs. |
+| `clux logout` | none | Stops and removes the background service, then removes stored credentials (your answers to the one-time questions are kept). |
 | `clux whoami` | none | Shows the identity of the currently configured host (dials the backend to re-verify stored credentials). |
 | `clux doctor` | none | Checks the local environment: Docker CLI reachability, whether the Docker daemon can actually run CPU/memory resource-limited containers (catches cgroup v2 "threaded mode" setups that reject `--cpus`/`--memory` before a workspace start fails the same way), stored credentials, system info collection, and backend connectivity. |
-| `clux host start` | `--interval <duration>` (default `30s`)<br>`--no-native-prompt` (macOS: don't offer the native runtime) | Registers this machine and keeps it online in the foreground: opens the tunnel, sends heartbeats on the given interval, and answers workspace lifecycle commands from the backend. Reconnects automatically (see *Connection resilience*). Only one instance runs per machine (`~/.clux/host.lock`). Exits cleanly on SIGINT/SIGTERM; running workspace containers are left running. |
+| `clux host start` | `--foreground` (stay in this terminal, never offer the service; what the service runs)<br>`--background` (use the service even after an earlier "no")<br>`--interval <duration>` (default `30s`)<br>`--no-native-prompt` (macOS: don't offer the native runtime) | Registers this machine and keeps it online: opens the tunnel, sends heartbeats on the given interval, and answers workspace lifecycle commands from the backend. Reconnects automatically (see *Connection resilience*). In a terminal it first logs in if needed and offers the background service (see *Usage*); if the service already runs it says so and exits 0. Only one instance runs per machine (`~/.clux/host.lock`). Exits cleanly on SIGINT/SIGTERM; running workspace containers are left running. |
+| `clux host stop` | none | Stops the background service and removes it, so it does not start at the next login. If a `clux host start` runs in a terminal, says so (stop it with Ctrl+C there). |
+| `clux host status` | none | Local summary (does not dial the backend): background service state and pid, a terminal instance if any, host name/id, backend, CLI version, last connection event from the log, native runtime slots and the workspaces they hold. |
+| `clux host logs` | `-f` (follow, across log rotation)<br>`-n N` (default 100) | Prints the end of `~/.clux/logs/host.log`. |
 | `clux native install` | `--owner <user>` (default: the account that ran `sudo`)<br>`--slots N` (agent users = native workspaces that can exist at once; default: keep, 4 at first) | macOS, root. Sets up the native runtime for iOS/Xcode workspaces (see *Native macOS runtime*). Idempotent; re-run it after updating `clux` to update the daemons, or with another `--slots` to grow/shrink the pool. |
 | `clux native uninstall` | `--purge` (also delete workspace files) | macOS, root. Removes the daemons, pf anchor, config and runtime. Deleting the hidden account needs Full Disk Access; without it the exact commands to finish are printed. |
 | `clux native status` | none | Shows the native runtime's state: account, daemons, pf, Seatbelt self-check, running workspaces. |
@@ -67,6 +88,31 @@ register, then again on every heartbeat, so the backend knows how much
 capacity is actually available to schedule workspaces onto.
 
 See [`internal/tunnel`](internal/tunnel) for the wire protocol.
+
+## Background service
+
+`clux host start` answered with "yes" (or `--background`) installs a
+per-user service that runs `<clux binary> host start --foreground
+--no-native-prompt` (the absolute path of the binary you ran, symlinks
+resolved; a binary in a temp dir or Go build cache gets a warning):
+
+- **macOS:** LaunchAgent `~/Library/LaunchAgents/space.clux.host.plist` in
+  your `gui/<uid>` domain (`launchctl bootstrap`), no root. Starts at login
+  (`RunAtLoad`), restarted after an error exit (`KeepAlive.SuccessfulExit =
+  false`, at most every 10 s), not after a clean stop.
+- **Linux:** systemd user unit `~/.config/systemd/user/clux-host.service`
+  (`systemctl --user enable` + restart), `Restart=on-failure`,
+  `RestartSec=10`. A user service runs while you are logged in; for a server
+  that should stay online after logout, run `loginctl enable-linger $USER`.
+- **Windows:** not supported yet; `clux host start` says so and runs in
+  the foreground.
+
+The service gets your `PATH` from install time (so it finds `docker`) and
+`CLUX_SERVICE=1`. It writes `~/.clux/logs/host.log` (its raw stdout/stderr
+go to `~/.clux/logs/service.log`). When it cannot continue without you (not
+logged in, token revoked, CLI too old), it waits for a new `clux login` or
+an updated binary instead of restarting in a loop. `clux host stop` and
+`clux logout` remove it. It never touches the native runtime's root daemons.
 
 ## Native macOS runtime (iOS development)
 

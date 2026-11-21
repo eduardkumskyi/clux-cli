@@ -13,6 +13,9 @@ type Info struct {
 	CPUCores       float64
 	MemoryMB       int64
 	StorageGBTotal int64
+	// MachineID (internal/machineid) is not collected here; the caller
+	// sets it, and only the register frame carries it.
+	MachineID string
 }
 
 // Collect gathers the current machine's capacity. storageRoot is created if

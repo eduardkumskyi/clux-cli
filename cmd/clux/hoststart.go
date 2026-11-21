@@ -10,12 +10,9 @@ import (
 	"log"
 	"net"
 	"os"
-	"os/signal"
-	"path/filepath"
 	"regexp"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 
 	"github.com/eduardkumskyi/clux-cli/internal/backoff"
@@ -26,12 +23,14 @@ import (
 	"github.com/eduardkumskyi/clux-cli/internal/logx"
 	"github.com/eduardkumskyi/clux-cli/internal/native"
 	"github.com/eduardkumskyi/clux-cli/internal/netwatch"
+	"github.com/eduardkumskyi/clux-cli/internal/service"
 	"github.com/eduardkumskyi/clux-cli/internal/sysinfo"
 	"github.com/eduardkumskyi/clux-cli/internal/tunnel"
 )
 
-// Exit codes for `clux host start`, so a supervisor (a future launchd /
-// systemd unit) can tell "restart me" from "restarting won't help".
+// Exit codes for `clux host start`, so a supervisor (the launchd/systemd
+// service, internal/service) can tell "restart me" from "restarting won't
+// help"; exitRestart (background.go) asks for a restart.
 const (
 	exitFatalConfig    = 3 // token revoked/invalid, CLI too old: needs the user
 	exitAlreadyRunning = 4
@@ -64,44 +63,91 @@ func runHostStart(args []string) error {
 	fs := flag.NewFlagSet("host start", flag.ExitOnError)
 	interval := fs.Duration("interval", defaultHeartbeat, "heartbeat interval")
 	noNativePrompt := fs.Bool("no-native-prompt", false, "macOS: don't offer to install the native runtime (set it up later with `sudo clux native install`)")
+	foreground := fs.Bool("foreground", false, "run in this terminal; never offer or hand over to the background service (what the service itself runs)")
+	background := fs.Bool("background", false, "run as the background service, even if you answered no before")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-
-	cfg, err := config.Load()
-	if err != nil {
-		return err
+	if *foreground && *background {
+		return errors.New("--foreground and --background exclude each other")
 	}
 
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	ctx, stop := interruptContext()
 	defer stop()
-	// After the first Ctrl-C starts a graceful shutdown, restore the default
-	// signal behavior so a second Ctrl-C kills the process immediately.
-	go func() {
-		<-ctx.Done()
-		stop()
-	}()
 
 	stateDir, err := config.Dir()
 	if err != nil {
 		return err
 	}
+	// Prompts only on a terminal; scripts (`< /dev/null`) and the service
+	// behave exactly as before: foreground, no questions.
+	interactive := isTerminal(os.Stdin) && isTerminal(os.Stdout)
+	asService := os.Getenv(service.EnvService) == "1"
+
+	cfg, err := config.Read()
+	if err != nil {
+		return err
+	}
+	if !cfg.LoggedIn() {
+		switch {
+		case asService:
+			fmt.Fprintln(os.Stderr, "clux: not logged in; waiting for `clux login`")
+			if waitForCredentials(ctx, "", func(f string, a ...any) { fmt.Fprintf(os.Stderr, "clux: "+f+"\n", a...) }) {
+				return &exitError{code: exitRestart, err: errors.New("restarting with the new login")}
+			}
+			return nil
+		case interactive:
+			backend := cfg.BackendURL
+			if backend == "" {
+				backend = defaultBackendURL
+			}
+			if _, err := browserLogin(ctx, cfg, backend, os.Stdout); err != nil {
+				return err
+			}
+		default:
+			return config.ErrNotLoggedIn
+		}
+	}
+
+	svc, svcErr := newService()
+	if svcErr != nil {
+		svc = nil
+	}
+	if interactive && !*foreground && svc != nil && svc.Supported() {
+		if st, _ := svc.Status(); st.Running {
+			fmt.Println(alreadyInBackground)
+			return nil
+		}
+	}
+
 	lock, err := hostlock.Acquire(stateDir)
 	if err != nil {
 		if hostlock.IsHeld(err) {
+			if interactive && !*foreground {
+				// Only a terminal run can hold it here: a running service was
+				// handled above.
+				err = fmt.Errorf("%w; it runs in another terminal: press Ctrl+C there first, then run `clux host start` again to keep this computer online in the background", err)
+			}
 			return &exitError{code: exitAlreadyRunning, err: err}
 		}
 		return err
 	}
-	defer lock.Release()
+	// A closure: install may swap the lock (released, then re-taken).
+	defer func() { lock.Release() }()
 
 	// Log to stderr and to a rotating file, so an outage can be diagnosed
-	// after the fact (`~/.clux/logs/host.log`, 5 MB, 3 old files kept).
+	// after the fact (`~/.clux/logs/host.log`, 5 MB, 3 old files kept). The
+	// service writes the file only: its stderr is service.log, kept for
+	// crashes.
 	var out io.Writer = os.Stderr
-	logPath := filepath.Join(stateDir, "logs", "host.log")
+	logPath := hostLogPath(stateDir)
 	if lf, ferr := logx.OpenRotating(logPath, 5<<20, 3); ferr == nil {
 		defer lf.Close()
-		out = logx.Tee{Primary: os.Stderr, Secondary: []interface{ Write([]byte) (int, error) }{lf}}
+		if asService {
+			out = lf
+		} else {
+			out = logx.Tee{Primary: os.Stderr, Secondary: []interface{ Write([]byte) (int, error) }{lf}}
+		}
 	} else {
 		fmt.Fprintf(os.Stderr, "clux: not writing a log file (%v)\n", ferr)
 	}
@@ -114,6 +160,41 @@ func runHostStart(args []string) error {
 	// macOS: offer the native runtime once (interactive only), or warn if
 	// it is installed but unhealthy. Never blocks docker-only mode.
 	newNativeOffer(cfg, *noNativePrompt, log.Printf).run()
+
+	// Then the background service: asked once (interactive), remembered.
+	bg := &backgroundOffer{
+		interactive: interactive,
+		foreground:  *foreground,
+		background:  *background,
+		supported:   svc != nil && svc.Supported(),
+		answer:      cfg.Service,
+		save: func(answer string) error {
+			cfg.Service = answer
+			return config.Save(cfg)
+		},
+		install: func() error {
+			if svc == nil {
+				return svcErr
+			}
+			// The service takes the host lock itself.
+			lock.Release()
+			if err := installService(svc, cfg, os.Stdout); err != nil {
+				if l, lerr := hostlock.Acquire(stateDir); lerr == nil {
+					lock = l
+				} else {
+					return fmt.Errorf("%w (and %v)", err, lerr)
+				}
+				return err
+			}
+			return nil
+		},
+		in:  os.Stdin,
+		out: os.Stdout,
+	}
+	if bg.run() {
+		logger.Printf("handed over to the background service")
+		return nil
+	}
 
 	h := newHostLoop(cfg, *interval, logger)
 	h.caps = &native.Capabilities{Supervisor: func(ctx context.Context) (string, string, error) {
@@ -135,6 +216,16 @@ func runHostStart(args []string) error {
 		// Into host.log too, before exiting: after-the-fact diagnosis is the
 		// whole point of the file.
 		logger.Printf("fatal: %v", err)
+		if asService {
+			// Restarting cannot fix this; wait for the user instead of
+			// crash-looping every 10 s.
+			logger.Printf("waiting for `clux login` (or a clux update) before retrying")
+			logger.Flush()
+			if waitForCredentials(ctx, cfg.Token, logger.Printf) {
+				return &exitError{code: exitRestart, err: err}
+			}
+			return nil
+		}
 		return &exitError{code: exitFatalConfig, err: err}
 	}
 	return err
@@ -315,9 +406,9 @@ func (h *hostLoop) setCurrent(s *tunnel.Session) {
 // the session stayed registered (0 if it never registered); immediate means
 // the next attempt should not wait (sleep/wake, network change).
 func (h *hostLoop) session(ctx context.Context) (lived time.Duration, immediate bool, err error) {
-	info, err := sysinfo.Collect(config.DefaultStorageRoot())
+	info, err := collectInfo()
 	if err != nil {
-		return 0, false, fmt.Errorf("collecting system info: %w", err)
+		return 0, false, err
 	}
 
 	caps := h.caps.Collect(ctx)

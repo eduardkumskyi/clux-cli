@@ -13,7 +13,6 @@ package main
 import (
 	"context"
 	"errors"
-	"flag"
 	"fmt"
 	"os"
 	"os/exec"
@@ -21,7 +20,6 @@ import (
 	"time"
 
 	"github.com/eduardkumskyi/clux-cli/internal/config"
-	"github.com/eduardkumskyi/clux-cli/internal/sysinfo"
 	"github.com/eduardkumskyi/clux-cli/internal/tunnel"
 )
 
@@ -58,12 +56,18 @@ func main() {
 		fmt.Println("clux version", version)
 	case "host":
 		if len(args) < 1 {
-			err = fmt.Errorf("usage: clux host <start>")
+			err = fmt.Errorf("usage: clux host <start|stop|status|logs>")
 			break
 		}
 		switch args[0] {
 		case "start":
 			err = runHostStart(args[1:])
+		case "stop":
+			err = runHostStop(args[1:])
+		case "status":
+			err = runHostStatus(args[1:])
+		case "logs":
+			err = runHostLogs(args[1:])
 		default:
 			err = fmt.Errorf("unknown host subcommand %q", args[0])
 		}
@@ -91,55 +95,21 @@ func printUsage() {
 	fmt.Fprintln(os.Stderr, `usage: clux <command> [flags]
 
 commands:
-  login --token <PAT> [--backend-url <url>]   store credentials, verified against the backend
-  logout                                      remove stored credentials
+  login [--backend-url <url>]                 connect this computer: confirm a code in the browser
+  login --token <PAT> [--backend-url <url>]   connect with a token from the dashboard (servers/CI)
+  logout                                      stop the background service and remove stored credentials
   whoami                                      show the identity of the currently configured host
   doctor                                      check local environment (docker, config, connectivity)
-  host start [--interval <duration>] [--no-native-prompt]
-                                              connect and keep this host registered (foreground)
+  host start [--foreground | --background] [--interval <duration>] [--no-native-prompt]
+                                              keep this computer online; in a terminal it offers
+                                              (once) to run in the background, starting at login
+  host stop                                   stop the background service (and keep it from starting at login)
+  host status                                 background service, connected host, backend, native runtime
+  host logs [-f] [-n N]                       print (or follow) ~/.clux/logs/host.log
   native install [--owner <user>] [--slots N] (macOS, root) set up the native runtime for iOS/Xcode workspaces
   native uninstall [--purge]                  (macOS, root) remove the native runtime
   native status                               show the native runtime's state
   version                                     print the CLI version`)
-}
-
-func runLogin(args []string) error {
-	fs := flag.NewFlagSet("login", flag.ExitOnError)
-	token := fs.String("token", "", "personal access token issued for this host (required)")
-	backendURL := fs.String("backend-url", defaultBackendURL, "backend base URL")
-	if err := fs.Parse(args); err != nil {
-		return err
-	}
-	if *token == "" {
-		return fmt.Errorf("--token is required (create a host and copy its token from the Clux dashboard)")
-	}
-
-	info, err := sysinfo.Collect(config.DefaultStorageRoot())
-	if err != nil {
-		return fmt.Errorf("collecting system info: %w", err)
-	}
-
-	sess, err := tunnel.Dial(context.Background(), *backendURL, *token, version, info, nil)
-	if err != nil {
-		return fmt.Errorf("could not verify token: %w", err)
-	}
-	defer sess.Close()
-
-	cfg := &config.Config{BackendURL: *backendURL, Token: *token, HostName: sess.Name}
-	if err := config.Save(cfg); err != nil {
-		return fmt.Errorf("saving credentials: %w", err)
-	}
-
-	fmt.Printf("Logged in as host %q (id=%d)\n", sess.Name, sess.HostID)
-	return nil
-}
-
-func runLogout(args []string) error {
-	if err := config.Remove(); err != nil {
-		return fmt.Errorf("removing credentials: %w", err)
-	}
-	fmt.Println("Logged out.")
-	return nil
 }
 
 func runWhoami(args []string) error {
@@ -147,9 +117,9 @@ func runWhoami(args []string) error {
 	if err != nil {
 		return err
 	}
-	info, err := sysinfo.Collect(config.DefaultStorageRoot())
+	info, err := collectInfo()
 	if err != nil {
-		return fmt.Errorf("collecting system info: %w", err)
+		return err
 	}
 
 	sess, err := tunnel.Dial(context.Background(), cfg.BackendURL, cfg.Token, version, info, nil)
@@ -180,7 +150,7 @@ func runDoctor(args []string) error {
 	check("credentials configured", cfgErr)
 
 	if cfgErr == nil {
-		info, infoErr := sysinfo.Collect(config.DefaultStorageRoot())
+		info, infoErr := collectInfo()
 		check("system info collection", infoErr)
 		if infoErr == nil {
 			sess, dialErr := tunnel.Dial(context.Background(), cfg.BackendURL, cfg.Token, version, info, nil)

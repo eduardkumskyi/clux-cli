@@ -2,6 +2,8 @@ package tunnel
 
 import (
 	"context"
+	"runtime"
+	"strings"
 	"testing"
 	"time"
 
@@ -44,6 +46,33 @@ func TestRegisterCarriesCapabilities(t *testing.T) {
 	defer fb2.mu.Unlock()
 	if _, ok := fb2.reg["capabilities"]; ok {
 		t.Fatal("nil capabilities must be omitted")
+	}
+}
+
+func TestRegisterCarriesMachineIDAndPlatform(t *testing.T) {
+	id := strings.Repeat("ab", 32)
+	for _, tc := range []struct {
+		machineID string
+		wantID    bool
+	}{{id, true}, {"", false}} {
+		fb := newFakeBackend(t, "alive")
+		sess, err := Dial(context.Background(), fb.srv.URL, "tok", "0.5.0", sysinfo.Info{MachineID: tc.machineID}, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		sess.Close()
+		fb.mu.Lock()
+		reg := fb.reg
+		fb.mu.Unlock()
+		if got, ok := reg["machine_id"]; ok != tc.wantID || (ok && got != id) {
+			t.Fatalf("machine_id %q: register frame %v", tc.machineID, reg)
+		}
+		if reg["os"] != runtime.GOOS || reg["arch"] != runtime.GOARCH {
+			t.Fatalf("os/arch missing: %v", reg)
+		}
+	}
+	if _, ok := heartbeatFrame(sysinfo.Info{MachineID: id}, "1", nil)["machine_id"]; ok {
+		t.Fatal("machine_id belongs to register only")
 	}
 }
 
