@@ -2,6 +2,7 @@ package supervisor
 
 import (
 	"encoding/binary"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -43,6 +44,9 @@ func TestParseProcArgsEmptyArgument(t *testing.T) {
 }
 
 func TestSidecarEnv(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("native macOS runtime: POSIX paths, never runs on Windows")
+	}
 	env := SidecarEnv(SidecarEnvParams{
 		WorkspaceID: "12", WorkspaceDir: "/private/var/clux/workspaces/12", Port: 40000,
 		HMACSecret: "s3cret", ProxyURL: "http://ws-12:pw@127.0.0.1:47821",

@@ -7,6 +7,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -276,6 +277,9 @@ func testProfileParams(t *testing.T) ProfileParams {
 }
 
 func TestSandboxProfileContents(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("native macOS runtime: POSIX paths, never runs on Windows")
+	}
 	p, err := SandboxProfile(testProfileParams(t))
 	if err != nil {
 		t.Fatal(err)
@@ -369,6 +373,9 @@ func TestPlistsAreWellFormed(t *testing.T) {
 }
 
 func TestConfigValidate(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("native macOS runtime: POSIX paths, never runs on Windows")
+	}
 	slots := func() []Slot {
 		return []Slot{{1, "_clux1", 431, 431}, {2, "_clux2", 433, 433}}
 	}

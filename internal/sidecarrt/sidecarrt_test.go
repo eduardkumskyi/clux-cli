@@ -11,6 +11,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -80,6 +81,9 @@ func makeTarGz(t *testing.T, entries []tarEntry) []byte {
 }
 
 func TestExtractRejectsEscapesAndLinks(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("native macOS runtime: POSIX paths, never runs on Windows")
+	}
 	for name, entries := range map[string][]tarEntry{
 		"dotdot":   {{name: "../evil", body: "x"}},
 		"absolute": {{name: "/etc/evil", body: "x"}},
@@ -160,6 +164,9 @@ func testInstaller(t *testing.T) (*Installer, *httptest.Server, *atomic.Value, [
 }
 
 func TestEnsureInstallsOnceAndReuses(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("native macOS runtime: POSIX paths, never runs on Windows")
+	}
 	i, srv, lastAuth, bundle := testInstaller(t)
 	var calls []string
 	i.run = fakeUV(&calls)
@@ -214,6 +221,9 @@ func TestUVHashMismatchRejected(t *testing.T) {
 }
 
 func TestTokenOnlySentToBackendOrigin(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("native macOS runtime: POSIX paths, never runs on Windows")
+	}
 	i, srv, lastAuth, bundle := testInstaller(t)
 	var calls []string
 	i.run = fakeUV(&calls)
