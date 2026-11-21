@@ -50,7 +50,7 @@ Run `clux help` for the full command list.
 | `clux whoami` | none | Shows the identity of the currently configured host (dials the backend to re-verify stored credentials). |
 | `clux doctor` | none | Checks the local environment: Docker CLI reachability, whether the Docker daemon can actually run CPU/memory resource-limited containers (catches cgroup v2 "threaded mode" setups that reject `--cpus`/`--memory` before a workspace start fails the same way), stored credentials, system info collection, and backend connectivity. |
 | `clux host start` | `--interval <duration>` (default `30s`)<br>`--no-native-prompt` (macOS: don't offer the native runtime) | Registers this machine and keeps it online in the foreground: opens the tunnel, sends heartbeats on the given interval, and answers workspace lifecycle commands from the backend. Reconnects automatically (see *Connection resilience*). Only one instance runs per machine (`~/.clux/host.lock`). Exits cleanly on SIGINT/SIGTERM; running workspace containers are left running. |
-| `clux native install` | `--owner <user>` (default: the account that ran `sudo`) | macOS, root. Sets up the native runtime for iOS/Xcode workspaces (see *Native macOS runtime*). Idempotent; re-run it after updating `clux` to update the daemons. |
+| `clux native install` | `--owner <user>` (default: the account that ran `sudo`)<br>`--slots N` (agent users = native workspaces that can exist at once; default: keep, 4 at first) | macOS, root. Sets up the native runtime for iOS/Xcode workspaces (see *Native macOS runtime*). Idempotent; re-run it after updating `clux` to update the daemons, or with another `--slots` to grow/shrink the pool. |
 | `clux native uninstall` | `--purge` (also delete workspace files) | macOS, root. Removes the daemons, pf anchor, config and runtime. Deleting the hidden account needs Full Disk Access; without it the exact commands to finish are printed. |
 | `clux native status` | none | Shows the native runtime's state: account, daemons, pf, Seatbelt self-check, running workspaces. |
 | `clux version` | none | Prints the CLI version. |
@@ -97,34 +97,65 @@ pointing at `clux doctor`.
 
 What `install` sets up:
 
-- **A hidden user `_clux`** (uid/gid from 400-499, own primary group, not in
-  `staff`, no password, home `/private/var/clux`, mode 700). Everything a
-  workspace runs -- sidecar, claude CLI, builds, simulators -- runs as this
-  user, started by a LaunchDaemon (`space.clux.native.supervisor`, outside
-  your login session), so it has no access to your home, Keychain,
-  clipboard, apps or desktop. Workspaces live in
-  `/private/var/clux/workspaces/<id>`.
+- **A pool of hidden agent users ("slots")** `_clux1`..`_cluxN` (default 4,
+  `--slots N`, up to 32; uid/gid from 400-499, each with its own primary
+  group, not in `staff` or `admin`, no password, home
+  `/private/var/clux/slots/<n>`, mode 700). Each native workspace is
+  assigned a free slot on its first start and keeps it until it is deleted;
+  everything it runs -- sidecar, claude CLI, builds, simulators and the apps
+  in them -- runs as that slot's user, started by the slot's LaunchDaemon
+  (`space.clux.native.supervisor.<n>`, outside your login session). So a
+  workspace has no access to your home, Keychain, clipboard, apps or
+  desktop, nor to another workspace's files, processes or environment.
+  Its files live in `/private/var/clux/slots/<n>/workspaces/<id>`. With all
+  slots held, a start fails with `all N native slots in use`; re-run
+  `sudo clux native install --slots M` to grow the pool (shrinking refuses
+  to remove a slot that still holds a workspace). Deleting a workspace
+  wipes its slot (files, simulators, DerivedData, caches) before the slot
+  is reused. Root never writes inside a slot's home: install only creates
+  the home itself, the slot's supervisor fills it.
 - **A pf firewall anchor** (`com.apple/clux`, root LaunchDaemon
   `space.clux.native.pf`, which also enables pf at boot and keeps its pf
-  reference token): every TCP/UDP packet `_clux` sends is refused, IPv4 and
-  IPv6, except to the egress proxy on `127.0.0.1:<port>` and to `_clux`'s
-  own loopback listeners (dev servers, the sidecar). Your own localhost
-  services (databases, dev servers) are unreachable for it; you can still
-  reach its listeners (port previews).
+  reference token): every TCP and UDP packet a slot user sends is refused,
+  IPv4 and IPv6, except TCP to the egress proxy on
+  `127.0.0.1:<port>` and to that slot's own loopback listeners (dev
+  servers, the sidecar). Your own localhost services (databases, dev
+  servers) and other workspaces' listeners are unreachable for it; you can
+  still reach its listeners (port previews). Known limits (outside the
+  Seatbelt sandbox only, i.e. simulator apps; see SECURITY.md): DNS
+  lookups through the system resolver and ICMP can't be blocked per user
+  without a system extension. The daemon re-checks every few
+  seconds that pf still holds these rules and that the main ruleset still
+  evaluates `com.apple/*`, repairs either, and publishes its status in the
+  root-owned `/private/var/run/clux-native/`; a supervisor refuses to start
+  a workspace unless that status is current and covers its uid.
 - **An egress proxy** inside `clux host start` (running as you): the only
   way out. Each workspace has an allow list (from the project, e.g.
   `api.anthropic.com`, `*.github.com`); a request to any other host is held
   for up to 60 s while you're asked in the Clux UI (allow once / allow for
-  the project / deny), then denied. Loopback addresses are never reachable
-  through it, private/LAN addresses only when listed by exact name. Every
+  the project / deny), then denied. Host names -- listed, wildcard, approved
+  in a prompt or in "open" mode -- only ever reach public addresses (the
+  resolved address is checked when dialing, so DNS rebinding can't point
+  them at your network). Private/LAN, CGNAT, link-local (incl. cloud
+  metadata) and ULA addresses are reachable only by an explicit IP or CIDR
+  entry (`192.168.1.20`, `10.0.0.0/8:5432`); loopback never. Every
   connection is logged to the backend.
 - **A Seatbelt sandbox** per workspace (generated profile, deny by default:
-  read/write only the workspace and the agent's `Library`, no git hooks,
-  network to localhost only). A self-check runs at supervisor start; the
-  result (`sandbox: active|unavailable`) is reported to the dashboard.
+  read/write only the workspace and the slot's `Library`, no git hooks,
+  network to localhost only, no system DNS resolver). A self-check runs at
+  supervisor start; the result (`sandbox: active|unavailable`) is reported
+  to the dashboard.
 - `/etc/clux/native.json` (config), `/private/var/clux-runtime` (sidecar
   runtimes: bundle, Python 3.12 venv, claude CLI; written by you, read-only
-  for `_clux`), logs in `/private/var/log/clux-native/`.
+  for the slots via group `_cluxslots`), logs in
+  `/private/var/log/clux-native/` (`pf.log`, `supervisor-<n>.log`).
+
+An install of the earlier single-user layout (`_clux`) is migrated by
+re-running `sudo clux native install`: its daemon and processes are
+stopped, its home (the old workspaces) is moved to
+`/private/var/clux-legacy-<time>` (root only), and the account is deleted
+when macOS allows it (otherwise it stays hidden, without password, with
+nothing running). Native workspaces start fresh in their new slots.
 
 The sidecar runtime is installed on the first native workspace start: the
 backend's sidecar bundle (sha256-checked), a pinned and sha256-checked `uv`,
@@ -132,9 +163,12 @@ Python 3.12, and the bundle's hashed requirements lock (wheels only). The
 two most recent runtimes are kept.
 
 **Uninstall:** `sudo clux native uninstall` (add `--purge` to also delete
-workspace files). macOS only lets a process with Full Disk Access delete an
-account record; without it everything else is removed and the remaining
-`dscl` commands are printed.
+workspace files). It stops every slot, releases pf, and removes the
+daemons, config, runtime, logs and your egress proxy key/policies and slot
+assignments in `~/.clux`. Without `--purge` the slot homes are kept but
+made root-only (no leftover uid owns reachable files). macOS only lets a
+process with Full Disk Access delete account records; without it
+everything else is removed and the remaining `dscl` commands are printed.
 
 ## Connection resilience
 
