@@ -40,6 +40,9 @@ func TestSidecarEnvBackendURL(t *testing.T) {
 	if v, _ := envValue(SidecarEnv(base), "CLUX_BACKEND_URL"); v != "https://api.clux.space" {
 		t.Fatalf("CLUX_BACKEND_URL = %q", v)
 	}
+	if v, _ := envValue(SidecarEnv(base), "CLUX_WORKSPACE_ID"); v != "12" {
+		t.Fatalf("CLUX_WORKSPACE_ID = %q", v)
+	}
 	base.BackendURL = "https://u:p@evil"
 	if _, ok := envValue(SidecarEnv(base), "CLUX_BACKEND_URL"); ok {
 		t.Fatal("an invalid URL must not reach the sidecar")

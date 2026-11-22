@@ -130,7 +130,9 @@ func SidecarEnv(p SidecarEnvParams) []string {
 	}
 	if ValidBackendURL(p.BackendURL) {
 		// Where the sidecar forwards the agent's host-command requests.
-		env = append(env, "CLUX_BACKEND_URL="+p.BackendURL)
+		// CLUX_WORKSPACE_ID mirrors the docker runtime (which has no
+		// WORKSPACE_ID); the sidecar reads it first.
+		env = append(env, "CLUX_BACKEND_URL="+p.BackendURL, "CLUX_WORKSPACE_ID="+p.WorkspaceID)
 	}
 	return env
 }

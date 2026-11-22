@@ -42,6 +42,10 @@ func (DockerRuntime) Start(ctx context.Context, frame map[string]any) (map[strin
 		HMACSecret:           stringField(frame, "hmac_secret"),
 		BackendURL:           backendURLField(frame),
 	}
+	if req.BackendURL != "" {
+		// Older backends' frames may lack workspace_id: then no host commands.
+		req.WorkspaceID, _ = workspaceIDField(frame)
+	}
 	res, err := dockerhost.Start(ctx, req)
 	if err != nil {
 		return nil, err

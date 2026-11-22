@@ -95,6 +95,10 @@ type StartRequest struct {
 	// BackendURL becomes the sidecar's CLUX_BACKEND_URL (host commands);
 	// "" when the backend sent none. Validated by the caller.
 	BackendURL string
+	// WorkspaceID becomes CLUX_WORKSPACE_ID next to CLUX_BACKEND_URL (the
+	// sidecar signs its host-command requests for this workspace). Not
+	// WORKSPACE_ID: that one changes other sidecar behaviour.
+	WorkspaceID string
 }
 
 // StartResult is the "extra" fields merged into the workspace.start result
@@ -168,8 +172,8 @@ func Start(ctx context.Context, req StartRequest) (StartResult, error) {
 		// images that might still look for it.
 		args = append(args, "-e", "SIDECAR_HMAC_SECRET="+req.HMACSecret, "-e", "HMAC_SECRET="+req.HMACSecret)
 	}
-	if req.BackendURL != "" {
-		args = append(args, "-e", "CLUX_BACKEND_URL="+req.BackendURL)
+	if req.BackendURL != "" && req.WorkspaceID != "" {
+		args = append(args, "-e", "CLUX_BACKEND_URL="+req.BackendURL, "-e", "CLUX_WORKSPACE_ID="+req.WorkspaceID)
 	}
 	args = append(args, req.Image)
 
