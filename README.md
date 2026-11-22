@@ -40,7 +40,10 @@ The first `clux host start` in a terminal walks through everything once:
 
 1. **Connect.** Without stored credentials it prints a link and a code,
    opens the browser, and waits while you confirm the code in the Clux app
-   (Ctrl+C cancels). `clux login` does the same on its own.
+   (Ctrl+C cancels). `clux login` does the same on its own. If the stored
+   credentials no longer work (the computer was removed on the website, or
+   its token revoked), it says so and runs the same login once, then carries
+   on with the new token.
 2. **Native runtime (Mac).** Offers to set up the native macOS runtime for
    iOS/Xcode workspaces (see *Native macOS runtime*).
 3. **Background.** Asks "Keep this computer online in the background
@@ -115,9 +118,13 @@ in the foreground):
 
 The service gets your `PATH` from install time (so it finds `docker`) and
 `CLUX_SERVICE=1`. It writes `~/.clux/logs/host.log` (its raw stdout/stderr
-go to `~/.clux/logs/service.log`). When it cannot continue without you (not
-logged in, token revoked, CLI too old), it waits for a new `clux login` or
-an updated binary instead of restarting in a loop. `clux host stop` and
+go to `~/.clux/logs/service.log`). It never prompts. Not logged in or CLI
+too old: it waits for a login or an updated binary instead of restarting in
+a loop. Token rejected (computer removed or revoked): it logs `token
+rejected: run "clux host start" in a terminal to connect this computer
+again` and exits cleanly, so launchd/systemd leave it stopped; `clux host
+status` shows the same hint, and the next `clux host start` in a terminal
+logs in again and brings the service back. `clux host stop` and
 `clux logout` remove it. It never touches the native runtime's root daemons.
 
 ## Native macOS runtime (iOS development)

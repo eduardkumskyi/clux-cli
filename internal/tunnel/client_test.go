@@ -55,6 +55,15 @@ func newFakeBackend(t *testing.T, mode string) *fakeBackend {
 			_ = c.WriteJSON(map[string]any{"type": "register_rejected", "reason": "maintenance"})
 			return
 		}
+		if fb.mode == "reject_revoked" {
+			_ = c.WriteJSON(map[string]any{"type": "register_rejected", "reason": "revoked"})
+			_ = c.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(CloseInvalidToken, ""))
+			return
+		}
+		if fb.mode == "close_invalid_token" {
+			_ = c.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(CloseInvalidToken, ""))
+			return
+		}
 		if fb.mode == "reject_outdated" {
 			_ = c.WriteJSON(map[string]any{"type": "register_rejected", "reason": "cli_outdated", "min_version": "9.9.9"})
 			_ = c.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(CloseCLIOutdated, ""))
@@ -193,6 +202,24 @@ func TestRegisterRejectedOutdatedIsFatal(t *testing.T) {
 	_, err := Dial(context.Background(), fb.srv.URL, "tok", "0.1.0", sysinfo.Info{}, nil)
 	if !IsFatal(err) {
 		t.Fatalf("want fatal error, got %v", err)
+	}
+}
+
+func TestTokenRejectionIsTypedAndFatal(t *testing.T) {
+	for _, mode := range []string{"reject_revoked", "close_invalid_token"} {
+		fb := newFakeBackend(t, mode)
+		_, err := Dial(context.Background(), fb.srv.URL, "tok", "0.3.0", sysinfo.Info{}, nil)
+		if !IsFatal(err) || !errors.Is(err, ErrTokenRejected) {
+			t.Fatalf("%s: want fatal ErrTokenRejected, got %v", mode, err)
+		}
+		if !strings.Contains(err.Error(), "clux host start") {
+			t.Errorf("%s: message should point at `clux host start`: %v", mode, err)
+		}
+	}
+	fb := newFakeBackend(t, "reject_outdated")
+	_, err := Dial(context.Background(), fb.srv.URL, "tok", "0.1.0", sysinfo.Info{}, nil)
+	if errors.Is(err, ErrTokenRejected) {
+		t.Fatalf("an outdated CLI is not a token rejection: %v", err)
 	}
 }
 

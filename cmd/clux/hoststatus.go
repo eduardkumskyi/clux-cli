@@ -16,6 +16,7 @@ import (
 	"github.com/eduardkumskyi/clux-cli/internal/config"
 	"github.com/eduardkumskyi/clux-cli/internal/hostlock"
 	"github.com/eduardkumskyi/clux-cli/internal/native"
+	"github.com/eduardkumskyi/clux-cli/internal/tunnel"
 )
 
 var hostlockHolder = hostlock.Holder
@@ -65,7 +66,7 @@ func runHostStatus(args []string) error {
 		}
 		row("Host", host)
 	} else {
-		row("Host", "not logged in (run `clux login`)")
+		row("Host", "not logged in (run `clux host start` in a terminal, or `clux login`)")
 	}
 	backend := cfg.BackendURL
 	if backend == "" {
@@ -75,6 +76,9 @@ func runHostStatus(args []string) error {
 	row("CLI", version)
 	if last := lastConnectionEvent(hostLogPath(stateDir)); last != "" {
 		row("Last event", last)
+		if tokenRejectedEvent(last) {
+			row("Action", tunnel.TokenRejectedHint)
+		}
 	}
 	if runtime.GOOS == "darwin" {
 		row("Native runtime", nativeSummary())
@@ -99,7 +103,7 @@ func lastConnectionEvent(path string) string {
 	sc.Buffer(make([]byte, 64<<10), 1<<20)
 	for sc.Scan() {
 		line := sc.Text()
-		for _, m := range []string{"registered as host", "reconnected as host", "tunnel down", "stopped (", "fatal:"} {
+		for _, m := range []string{"registered as host", "reconnected as host", "tunnel down", "stopped (", "fatal:", "token rejected:"} {
 			if strings.Contains(line, m) {
 				last = line
 				break
@@ -107,6 +111,14 @@ func lastConnectionEvent(path string) string {
 		}
 	}
 	return last
+}
+
+// tokenRejectedEvent: the agent stopped because the backend no longer
+// accepts this computer's token (see tunnel.ErrTokenRejected).
+func tokenRejectedEvent(line string) bool {
+	return strings.Contains(line, "token rejected:") ||
+		(strings.Contains(line, "fatal:") && strings.Contains(line, tunnel.ErrTokenRejected.Error())) ||
+		strings.Contains(line, "fatal: backend revoked this host's token")
 }
 
 // nativeSummary: installed state and which slots hold workspaces (the

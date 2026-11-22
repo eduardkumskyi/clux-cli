@@ -83,6 +83,26 @@ func IsFatal(err error) bool {
 	return errors.As(err, &f)
 }
 
+// ErrTokenRejected matches (errors.Is) every "the backend no longer accepts
+// this host's token" error: the computer was removed on the website or its
+// token revoked. Retrying cannot fix it; a new login can. These errors are
+// also ErrFatal.
+var ErrTokenRejected = errors.New("invalid or revoked token")
+
+// TokenRejectedHint tells the user how to fix ErrTokenRejected: a terminal
+// `clux host start` logs in again by itself.
+const TokenRejectedHint = "run `clux host start` in a terminal to connect this computer again"
+
+// tokenRejected is a descriptive ErrTokenRejected.
+type tokenRejected struct{ msg string }
+
+func (e *tokenRejected) Error() string        { return e.msg }
+func (e *tokenRejected) Is(target error) bool { return target == ErrTokenRejected }
+
+func errTokenRejected(format string, a ...any) error {
+	return &ErrFatal{&tokenRejected{fmt.Sprintf(format, a...) + " (" + TokenRejectedHint + ")"}}
+}
+
 // ErrSuperseded means another process (same token, maybe another machine)
 // registered this host and the backend dropped us in its favor.
 var ErrSuperseded = errors.New("another process or machine is using this host's token; it replaced this connection")
@@ -201,7 +221,7 @@ func Dial(ctx context.Context, backendURL, token, cliVersion string, info sysinf
 		if errors.As(err, &ce) {
 			switch ce.Code {
 			case CloseInvalidToken:
-				return nil, &ErrFatal{fmt.Errorf("registration rejected: invalid or revoked token (run `clux login` to connect this computer again)")}
+				return nil, errTokenRejected("registration rejected: invalid or revoked token")
 			case CloseCLIOutdated:
 				return nil, &ErrFatal{fmt.Errorf("registration rejected: this clux version is too old, update it (curl -fsSL https://clux.space/install.sh | sh)")}
 			}
@@ -216,7 +236,7 @@ func Dial(ctx context.Context, backendURL, token, cliVersion string, info sysinf
 		case "cli_outdated":
 			return nil, &ErrFatal{fmt.Errorf("registration rejected: clux %s is too old (backend needs >= %s); update: curl -fsSL https://clux.space/install.sh | sh", cliVersion, ack.MinVersion)}
 		case "invalid_token", "revoked":
-			return nil, &ErrFatal{fmt.Errorf("registration rejected: %s (run `clux login` to connect this computer again)", ack.Reason)}
+			return nil, errTokenRejected("registration rejected (%s): invalid or revoked token", ack.Reason)
 		}
 		// Unknown reason: may be transient (backend-side), retry with backoff.
 		return nil, fmt.Errorf("registration rejected: %s", ack.Reason)
@@ -556,7 +576,7 @@ func (s *Session) readLoop(ctx context.Context, h Handler) error {
 			if errors.As(err, &ce) {
 				switch ce.Code {
 				case CloseInvalidToken:
-					return &ErrFatal{fmt.Errorf("backend revoked this host's token")}
+					return errTokenRejected("backend revoked this host's token")
 				case CloseSuperseded:
 					return ErrSuperseded
 				case CloseStale:
