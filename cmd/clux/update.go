@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bufio"
 	"context"
 	"errors"
 	"flag"
@@ -43,7 +42,7 @@ type updater struct {
 	// says what it did (or what the user must do).
 	restart func(out io.Writer)
 	// native: the native runtime's own copy of clux (updated through its
-	// root daemon); nativeRefresh runs `sudo clux native install`, needed
+	// root daemon); nativeRefresh runs `sudo clux native install` (as part of the update), needed
 	// once for daemons too old to update themselves.
 	native        nativeDaemons
 	nativeRefresh func() error
@@ -160,25 +159,25 @@ func (u *updater) run(ctx context.Context, check bool, want string) error {
 }
 
 // syncNative brings the native runtime's copy of clux to tag through its
-// root daemon. Daemons too old to do that need one `sudo clux native
-// install`: on a terminal it is offered right away (sudo asks for the
-// password); otherwise only the command is printed.
+// root daemon. Daemons too old to do that are replaced once as part of this
+// same update: on a terminal it runs right away (macOS asks for the
+// password, nothing else); otherwise only the notice is printed.
 func (u *updater) syncNative(ctx context.Context, tag string, explicit bool) {
 	say := func(format string, args ...any) { fmt.Fprintf(u.out, format+"\n", args...) }
 	if syncNativeDaemons(ctx, u.native, tag, explicit, say) != nativeBootstrap {
 		return
 	}
-	if !u.interactive || os.Geteuid() == 0 {
-		return
+	if u.interactive && os.Geteuid() != 0 {
+		bootstrapNativeDaemon(u.out, u.nativeRefresh)
 	}
-	fmt.Fprint(u.out, "Refresh it now? [Y/n] ")
-	line, _ := bufio.NewReader(u.in).ReadString('\n')
-	if yes, ok := parseYesNo(line); !ok || !yes {
-		fmt.Fprintln(u.out, "OK. Run it later: sudo clux native install")
-		return
-	}
-	if err := u.nativeRefresh(); err != nil {
-		fmt.Fprintf(u.out, "Native runtime refresh failed: %v\nRetry with: sudo clux native install\n", err)
+}
+
+// bootstrapNativeDaemon replaces a native daemon too old to update itself.
+// It needs root once; later updates follow `clux update` without it.
+func bootstrapNativeDaemon(out io.Writer, refresh func() error) {
+	fmt.Fprintln(out, "Updating the native macOS runtime too. One time only: its old version can't update itself, so macOS asks for your password.")
+	if err := refresh(); err != nil {
+		fmt.Fprintf(out, "Native runtime update failed: %v\nRetry with: clux update\n", err)
 	}
 }
 

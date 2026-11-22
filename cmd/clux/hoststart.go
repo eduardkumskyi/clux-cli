@@ -218,6 +218,14 @@ func runHostStart(args []string) error {
 	// it is installed but unhealthy. Never blocks docker-only mode.
 	newNativeOffer(cfg, *noNativePrompt, log.Printf).run()
 
+	// A native daemon too old to update itself is replaced now, while a
+	// terminal is here for the password (once; afterwards it follows the
+	// CLI without root).
+	if interactive && os.Geteuid() != 0 &&
+		syncNativeDaemons(ctx, installedNativeDaemons{}, selfupdate.Tag(version), false, logger.Printf) == nativeBootstrap {
+		bootstrapNativeDaemon(os.Stdout, sudoNativeInstall)
+	}
+
 	if bg.run() {
 		logger.Printf("handed over to the background service")
 		return nil

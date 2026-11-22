@@ -94,3 +94,10 @@ esac
 
 echo "clux-install: installed to $DIR/clux"
 "$DIR/clux" version || true
+
+# The native macOS runtime (if set up) follows the CLI. `clux update` brings
+# it along; one installed before self-updating daemons is replaced once
+# (macOS asks for the password). Needs a terminal for that password.
+if [ "$(uname -s)" = Darwin ] && [ -f /Library/LaunchDaemons/space.clux.native.pf.plist ] && [ -r /dev/tty ]; then
+  "$DIR/clux" update </dev/tty || true
+fi

@@ -222,8 +222,9 @@ func TestUpdateRefusesHomebrewAndTemporaryBuilds(t *testing.T) {
 	}
 }
 
-// Daemons from before the self-update: one `sudo clux native install`,
-// said once, offered on a terminal; the root daemon is not asked.
+// Daemons from before the self-update: replaced once as part of the same
+// update on a terminal (no question; sudo asks for the password), only
+// noticed elsewhere; the root daemon is not asked.
 func TestUpdateBootstrapsOldNativeDaemonsOnce(t *testing.T) {
 	if os.Geteuid() == 0 {
 		t.Skip("the offer is skipped under sudo")
@@ -237,19 +238,18 @@ func TestUpdateBootstrapsOldNativeDaemonsOnce(t *testing.T) {
 	if f.refreshed || len(f.native.calls) != 0 {
 		t.Fatalf("refreshed %v calls %v", f.refreshed, f.native.calls)
 	}
-	if want := nativeBootstrapNotice("v0.5.2"); strings.Count(f.out.String(), want) != 1 || !strings.Contains(want, "Run this once: sudo clux native install") {
+	if want := nativeBootstrapNotice("v0.5.2"); strings.Count(f.out.String(), want) != 1 || !strings.Contains(want, "Run `clux update` once in a terminal") {
 		t.Fatalf("want the bootstrap notice exactly once; out:\n%s", f.out)
 	}
 
 	f2 := newFakeUpdate(t, "v0.5.2", "v0.6.0")
 	f2.native.installed = "v0.5.2"
 	f2.u.interactive = true
-	f2.u.in = strings.NewReader("y\n")
 	if err := f2.u.run(context.Background(), false, ""); err != nil {
 		t.Fatal(err)
 	}
-	if !f2.refreshed {
-		t.Fatalf("a yes must run the refresh; out:\n%s", f2.out)
+	if !f2.refreshed || strings.Contains(f2.out.String(), "[Y/n]") {
+		t.Fatalf("a terminal update must replace the old daemon without asking; out:\n%s", f2.out)
 	}
 }
 
