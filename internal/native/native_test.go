@@ -495,4 +495,12 @@ func TestSandboxProfileAllowsVarSpellingOfPrivateVar(t *testing.T) {
 	if strings.Contains(prof, `(subpath "/var/var/`) {
 		t.Error("double /var prefix")
 	}
+	// xcodebuild needs the LaunchServices type map to recognise a workspace;
+	// the world-readable 0/X per-user dirs stay closed.
+	if !strings.Contains(prof, `(global-name "com.apple.lsd.mapdb")`) {
+		t.Error("profile lacks com.apple.lsd.mapdb")
+	}
+	if strings.Contains(prof, "(C|T|0|X)") {
+		t.Error("profile opens the world-readable 0/X per-user dirs")
+	}
 }
