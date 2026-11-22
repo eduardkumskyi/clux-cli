@@ -474,6 +474,9 @@ func TestXcodeApp(t *testing.T) {
 // ("Path not accessible" for /var/clux/slots/3/Library/Preferences/...):
 // dirs under /private/var are also allowed in their /var spelling.
 func TestSandboxProfileAllowsVarSpellingOfPrivateVar(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("native macOS runtime: POSIX paths, never runs on Windows")
+	}
 	prof, err := SandboxProfile(ProfileParams{
 		WorkspaceDir: "/private/var/clux/slots/3/workspaces/622", AgentHome: "/private/var/clux/slots/3",
 		RuntimeDir: "/private/var/clux-runtime", UserCache: "/private/var/folders/f6/x/C", UserTemp: "/private/var/folders/f6/x/T",
