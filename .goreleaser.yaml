@@ -39,6 +39,20 @@ archives:
 checksum:
   name_template: "checksums.txt"
 
+# checksums.txt.sig: ed25519 signature over the tag and checksums.txt (see
+# internal/selfupdate/signature.go). `clux update` and the native root
+# daemon refuse a release from v0.7.0 on without a valid one. The tool
+# refuses a key the binary does not trust, so a wrong or missing secret
+# fails the release before anything is published.
+signs:
+  - id: checksums
+    artifacts: checksum
+    signature: "${artifact}.sig"
+    cmd: go
+    args: ["run", "./tools/releasesign", "sign", "-tag", "{{ .Tag }}", "-in", "${artifact}", "-out", "${signature}"]
+    env:
+      - CLUX_RELEASE_SIGNING_KEY={{ .Env.CLUX_RELEASE_SIGNING_KEY }}
+
 release:
   github:
     owner: eduardkumskyi

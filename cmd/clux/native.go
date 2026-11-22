@@ -58,6 +58,15 @@ func runNative(args []string) error {
 		return runSupervise(*slot)
 	case "pfd": // LaunchDaemon entry point (runs as root)
 		return runPFD()
+	case "daemon-check":
+		// Run by the root daemon on a freshly downloaded release before it
+		// replaces itself: prints this version if it can run this
+		// installation (reads its config).
+		if _, err := native.LoadConfig(); err != nil {
+			return err
+		}
+		fmt.Println(version)
+		return nil
 	default:
 		return fmt.Errorf("unknown native subcommand %q", args[0])
 	}
@@ -102,7 +111,22 @@ func runPFD() error {
 	logger := log.New(os.Stderr, "pfd: ", log.LstdFlags)
 	ctx, stop := daemonContext()
 	defer stop()
-	return native.RunPFD(ctx, logger.Printf)
+	return native.RunPFD(ctx, native.PFDOptions{Logf: logger.Printf, Version: version, SlotStatus: slotVersionBusy})
+}
+
+// slotVersionBusy (as root, for the self-update): the version slot n's
+// supervisor runs and whether it runs a workspace.
+func slotVersionBusy(ctx context.Context, n int) (string, bool, error) {
+	r, err := slotClient(native.Slot{N: n}).Call(ctx, supervisor.Request{Op: supervisor.OpStatus})
+	if err != nil {
+		return "", false, err
+	}
+	for _, w := range r.Workspaces {
+		if w.Running {
+			return r.Version, true, nil
+		}
+	}
+	return r.Version, false, nil
 }
 
 // slotClient is the owner's client for slot n's supervisor; it refuses a

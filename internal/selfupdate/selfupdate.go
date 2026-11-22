@@ -4,9 +4,11 @@
 // release's checksums.txt, extracts the binary and renames it over the old
 // one in the same directory, so a crash never leaves a half-written clux.
 //
-// checksums.txt comes from the same release as the archive: it catches a
-// corrupt or truncated download, not a compromised release. Signed releases
-// are a follow-up.
+// checksums.txt is trusted only once its signature (checksums.txt.sig, see
+// signature.go) verifies against a key embedded in this binary. Releases
+// older than FirstSignedRelease have none; only a caller that allows it
+// (`clux update`, never the root daemon) accepts those on the checksum
+// alone.
 package selfupdate
 
 import (
@@ -16,6 +18,7 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"crypto/ed25519"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -40,6 +43,7 @@ const (
 	// The archives are ~10 MB; anything far bigger is not a clux release.
 	maxArchiveBytes   = 200 << 20
 	maxChecksumsBytes = 1 << 20
+	maxSignatureBytes = 4 << 10
 )
 
 // Client talks to GitHub releases. Zero values use the real endpoints.
@@ -48,6 +52,15 @@ type Client struct {
 	APIBase      string // https://api.github.com
 	DownloadBase string // https://github.com
 	GOOS, GOARCH string
+	// Keys verify release signatures; nil = TrustedKeys().
+	Keys []ed25519.PublicKey
+}
+
+func (c *Client) keys() []ed25519.PublicKey {
+	if c.Keys != nil {
+		return c.Keys
+	}
+	return TrustedKeys()
 }
 
 func (c *Client) http() *http.Client {
@@ -117,28 +130,50 @@ func BinaryName(goos string) string {
 }
 
 // Download fetches the release's archive for c.GOOS/c.GOARCH, verifies it
-// against checksums.txt and returns the clux binary inside it.
-func (c *Client) Download(ctx context.Context, tag string) ([]byte, error) {
+// and returns the clux binary inside it. checksums.txt must carry a valid
+// signature over tag (signed = true); a bad signature is always an error.
+// A missing one is accepted (signed = false) only with allowUnsigned, and
+// only for a release older than FirstSignedRelease.
+func (c *Client) Download(ctx context.Context, tag string, allowUnsigned bool) (binary []byte, signed bool, err error) {
+	if !ValidTag(tag) {
+		return nil, false, fmt.Errorf("%q is not a release tag (e.g. v0.7.0)", tag)
+	}
 	asset := AssetName(c.GOOS, c.GOARCH)
 	base := fmt.Sprintf("%s/%s/releases/download/%s/", c.downloadBase(), Repo, tag)
 	sums, err := c.fetch(ctx, base+"checksums.txt", maxChecksumsBytes)
 	if err != nil {
-		return nil, err
+		return nil, false, err
+	}
+	sig, err := c.fetch(ctx, base+SignatureAsset, maxSignatureBytes)
+	switch {
+	case err == nil:
+		if err := VerifySignature(tag, sums, sig, c.keys()); err != nil {
+			return nil, false, err
+		}
+		signed = true
+	case !errors.Is(err, errNotFound):
+		return nil, false, err
+	case !allowUnsigned || !Older(tag, FirstSignedRelease):
+		return nil, false, fmt.Errorf("release %s has no %s (%w); refusing it", tag, SignatureAsset, ErrUnsigned)
 	}
 	want, err := checksumFor(sums, asset)
 	if err != nil {
-		return nil, fmt.Errorf("release %s: %w", tag, err)
+		return nil, false, fmt.Errorf("release %s: %w", tag, err)
 	}
 	archive, err := c.fetch(ctx, base+asset, maxArchiveBytes)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	got := sha256.Sum256(archive)
 	if hex.EncodeToString(got[:]) != want {
-		return nil, fmt.Errorf("%s does not match checksums.txt of %s (download corrupted?); nothing was changed", asset, tag)
+		return nil, false, fmt.Errorf("%s does not match checksums.txt of %s (download corrupted?); nothing was changed", asset, tag)
 	}
-	return extract(archive, c.GOOS)
+	binary, err = extract(archive, c.GOOS)
+	return binary, signed, err
 }
+
+// errNotFound: GitHub answered 404 for a release asset.
+var errNotFound = errors.New("not found")
 
 func (c *Client) fetch(ctx context.Context, url string, limit int64) ([]byte, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
@@ -151,7 +186,7 @@ func (c *Client) fetch(ctx context.Context, url string, limit int64) ([]byte, er
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode == http.StatusNotFound {
-		return nil, fmt.Errorf("%s not found (no such release, or no build for this platform)", url)
+		return nil, fmt.Errorf("%s %w (no such release, or no build for this platform)", url, errNotFound)
 	}
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("downloading %s: %s", url, resp.Status)

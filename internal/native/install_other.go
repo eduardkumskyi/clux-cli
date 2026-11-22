@@ -41,7 +41,7 @@ func Install(InstallOptions) error { return errMacOnly }
 func Uninstall(UninstallOptions) error { return errMacOnly }
 
 // RunPFD is macOS-only.
-func RunPFD(context.Context, func(string, ...any)) error { return errMacOnly }
+func RunPFD(context.Context, PFDOptions) error { return errMacOnly }
 
 // TCPListeners is macOS-only.
 func TCPListeners() ([]Listener, error) { return nil, errMacOnly }

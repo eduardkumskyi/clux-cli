@@ -77,10 +77,10 @@ Run `clux help` for the full command list.
 | `clux host stop` | none | Stops the background service and removes it, so it does not start at the next login. If a `clux host start` runs in a terminal, says so (stop it with Ctrl+C there). |
 | `clux host status` | none | Local summary (does not dial the backend): background service state and pid, a terminal instance if any, host name/id, backend, CLI version, last connection event from the log, native runtime slots and the workspaces they hold. |
 | `clux host logs` | `-f` (follow, across log rotation)<br>`-n N` (default 100) | Prints the end of `~/.clux/logs/host.log`. |
-| `clux native install` | `--owner <user>` (default: the account that ran `sudo`)<br>`--slots N` (agent users = native workspaces that can exist at once; default: keep, 4 at first) | macOS, root. Sets up the native runtime for iOS/Xcode workspaces (see *Native macOS runtime*). Idempotent; re-run it after updating `clux` to update the daemons, or with another `--slots` to grow/shrink the pool. |
+| `clux native install` | `--owner <user>` (default: the account that ran `sudo`)<br>`--slots N` (agent users = native workspaces that can exist at once; default: keep, 4 at first) | macOS, root. Sets up the native runtime for iOS/Xcode workspaces (see *Native macOS runtime*). Idempotent; re-run it with another `--slots` to grow/shrink the pool. From v0.7.0 on the daemons follow `clux update` by themselves (see *Updates*); an older install needs this once. |
 | `clux native uninstall` | `--purge` (also delete workspace files) | macOS, root. Removes the daemons, pf anchor, config and runtime. Deleting the hidden account needs Full Disk Access; without it the exact commands to finish are printed. |
 | `clux native status` | none | Shows the native runtime's state: account, daemons, pf, Seatbelt self-check, running workspaces. |
-| `clux update` | `--check` (only say whether a newer release exists)<br>`--version vX.Y.Z` (install that release, also to go back) | Downloads the release archive for this OS/architecture from GitHub, checks it against the release's `checksums.txt`, and swaps the binary in place (temp file in the same directory, then rename, so a failure leaves the old one). If that directory needs admin rights (`/usr/local/bin`) it uses `sudo` in a terminal, or says what to run. Restarts the background service if installed; a `clux host start` in a terminal is pointed out. With the native runtime installed, its daemons keep their own older copy until `sudo clux native install`, which `clux update` offers to run. Homebrew installs: `brew upgrade clux`. `clux host start` prints a one-line notice when the backend reports a newer release. |
+| `clux update` | `--check` (only say whether a newer release exists)<br>`--version vX.Y.Z` (install that release, also to go back) | Downloads the release archive for this OS/architecture from GitHub, checks the release's signed `checksums.txt` (see *Release signing*) and the archive against it, and swaps the binary in place (temp file in the same directory, then rename, so a failure leaves the old one). If that directory needs admin rights (`/usr/local/bin`) it uses `sudo` in a terminal, or says what to run. Restarts the background service if installed; a `clux host start` in a terminal is pointed out. With the native runtime installed, it then has the root daemon update the native runtime's own copy too, without sudo (see *Native macOS runtime > Updates*). Homebrew installs: `brew upgrade clux`. `clux host start` prints a one-line notice when the backend reports a newer release. |
 | `clux version` | none | Prints the CLI version. |
 | `clux help` (also `-h`, `--help`) | none | Prints usage. |
 
@@ -222,6 +222,20 @@ backend's sidecar bundle (sha256-checked), a pinned and sha256-checked `uv`,
 Python 3.12, and the bundle's hashed requirements lock (wheels only). The
 two most recent runtimes are kept.
 
+**Updates.** The daemons run their own root-owned copy of `clux`. You only
+ever update the CLI: `clux update`, and `clux host start` whenever the
+daemons run an older version than itself, ask the root pf daemon (over the
+slot keeper's owner-only socket) to move to that release. Root never takes
+a binary from you: it downloads the release from GitHub itself, requires a
+valid signature and checksum, runs the new binary once to check it is that
+release and can read this installation, then swaps it atomically and
+records the version in `/etc/clux/native.json`. Supervisors of idle slots
+restart onto it at once; a slot running a workspace switches when that
+workspace stops, so no turn is cut off. The root daemon restarts itself last,
+once no slot is busy. It only moves forward, unless you pass an explicit
+`clux update --version` (still signed releases only). Daemons installed
+before v0.7.0 can't do this yet: run `sudo clux native install` once.
+
 **Uninstall:** `sudo clux native uninstall` (add `--purge` to also delete
 workspace files). It stops every slot, releases pf, and removes the
 daemons, config, runtime, logs and your egress proxy key/policies and slot
@@ -250,6 +264,40 @@ everything else is removed and the remaining `dscl` commands are printed.
 - **Logs.** Every line is timestamped, repeated identical errors collapse into
   one line, and everything is also written to `~/.clux/logs/host.log`
   (rotated at 5 MB, 3 old files kept).
+
+## Release signing
+
+Every release from v0.7.0 on has `checksums.txt.sig`: an ed25519 signature
+over `"clux-release-v1\n" + tag + "\n" + checksums.txt`, so it also pins the
+release it belongs to. The release workflow makes it with
+`tools/releasesign` from the GitHub Actions secret `CLUX_RELEASE_SIGNING_KEY`
+(base64 ed25519 seed). The public keys live in
+`internal/selfupdate/signature.go` (`trustedKeysBase64`). `clux update`
+refuses a release from v0.7.0 on with a missing or bad signature, and
+accepts older releases on their checksum alone, with a warning. The native
+root daemon never accepts an unsigned release. To check a release by hand:
+
+```sh
+go run ./tools/releasesign verify -tag vX.Y.Z -in checksums.txt -sig checksums.txt.sig
+```
+
+**Key rotation.** The old key has to sign the release that introduces the
+new one, since installed binaries only trust the keys they embed.
+
+1. `go run ./tools/releasesign keygen -out new.key` prints the new public
+   key. Add it to `trustedKeysBase64` next to the old one, and release
+   (still signed with the old secret).
+2. Once most installs have that release, store the new key:
+   `gh secret set CLUX_RELEASE_SIGNING_KEY < new.key`, then delete
+   `new.key`. Release.
+3. Later, remove the old key from `trustedKeysBase64` and release.
+
+If the old key leaks, do steps 1 to 3 back to back and drop the old key in
+the same release. If it is lost, binaries that only trust it can't take
+signed releases any more: reinstall with `install.sh`, then run
+`sudo clux native install` for the native runtime. `tools/releasesign sign`
+refuses a key that the binary doesn't trust, so a wrong secret fails the
+release before anything is published.
 
 ## License
 
