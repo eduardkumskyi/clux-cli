@@ -54,8 +54,8 @@ func (d installedNativeDaemons) WaitForDaemon(ctx context.Context, tag string) e
 
 // nativeBootstrapNotice: daemons too old to update themselves.
 func nativeBootstrapNotice(installed string) string {
-	return fmt.Sprintf("The native macOS runtime runs clux %s, which can't update itself. Run this once: sudo clux native install "+
-		"(after that it follows `clux update` by itself, without sudo)", installed)
+	return fmt.Sprintf("The native macOS runtime runs clux %s, which can't update itself. Run `clux update` once in a terminal "+
+		"to replace it (macOS asks for your password); after that it follows `clux update` by itself", installed)
 }
 
 // nativeBehind says whether the daemons should move to tag: behind it, or
@@ -73,7 +73,7 @@ type nativeSync int
 const (
 	nativeCurrent   nativeSync = iota // nothing to do (or not installed)
 	nativeUpdated                     // moved to the tag (maybe with deferred restarts)
-	nativeBootstrap                   // too old to update itself: sudo clux native install
+	nativeBootstrap                   // too old to update itself: replaced once, as root
 	nativeFailed
 )
 
