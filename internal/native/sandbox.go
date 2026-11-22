@@ -152,6 +152,10 @@ func SandboxProfile(p ProfileParams) (string, error) {
   (global-name "com.apple.CoreSimulator.CoreSimulatorService")
   (global-name "com.apple.CoreSimulator.simdiskimaged")
   (xpc-service-name "com.apple.MTLCompilerService"))
+;; the agent's own preferences (cfprefsd serves only its uid's domains,
+;; stored in the slot home). Without this every read comes back empty, so
+;; xcodebuild never saw IDEPackageSupportDisableManifestSandbox.
+(allow user-preference-read user-preference-write)
 (allow iokit-open-user-client
   (iokit-user-client-class "IOSurfaceRootUserClient")
   (iokit-user-client-class "AGXDeviceUserClient"))
