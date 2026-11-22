@@ -508,7 +508,7 @@ func (s *Server) spawn(req Request, rt RuntimeSpec) (*proc, error) {
 	cmd.Dir = wsDir
 	cmd.Env = SidecarEnv(SidecarEnvParams{
 		WorkspaceID: id, WorkspaceDir: wsDir, Port: port, HMACSecret: req.HMACSecret,
-		GithubCloneURL: req.GithubCloneURL, ProxyURL: req.ProxyURL, Runtime: rt,
+		GithubCloneURL: req.GithubCloneURL, ProxyURL: req.ProxyURL, BackendURL: req.BackendURL, Runtime: rt,
 		DeveloperDir: s.base.DeveloperDir, CPUCount: runtime.NumCPU(), MemoryMB: int64(mem >> 20),
 		AgentUser: s.slot.User, GitTemplateDir: s.gitTemplateDir(),
 	})

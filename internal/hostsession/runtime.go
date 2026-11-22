@@ -6,6 +6,7 @@ import (
 	"strconv"
 
 	"github.com/eduardkumskyi/clux-cli/internal/dockerhost"
+	"github.com/eduardkumskyi/clux-cli/internal/supervisor"
 )
 
 // Runtime names in the "runtime" field of workspace.start/stop/delete.
@@ -39,6 +40,7 @@ func (DockerRuntime) Start(ctx context.Context, frame map[string]any) (map[strin
 		SidecarContainerPort: int(intField(frame, "sidecar_container_port")),
 		GithubCloneURL:       stringField(frame, "github_clone_url"),
 		HMACSecret:           stringField(frame, "hmac_secret"),
+		BackendURL:           backendURLField(frame),
 	}
 	res, err := dockerhost.Start(ctx, req)
 	if err != nil {
@@ -68,6 +70,17 @@ func (DockerRuntime) Status(ctx context.Context, frame map[string]any) (map[stri
 		return nil, err
 	}
 	return map[string]any{"running": running}, nil
+}
+
+// backendURLField is workspace.start's "backend_url" when it is a plain
+// http(s) URL, else "" (older backends send none: the sidecar then runs
+// without CLUX_BACKEND_URL and host commands are unavailable).
+func backendURLField(frame map[string]any) string {
+	raw := stringField(frame, "backend_url")
+	if !supervisor.ValidBackendURL(raw) {
+		return ""
+	}
+	return raw
 }
 
 // runtimeName reads a frame's "runtime" (absent = docker, which is what
