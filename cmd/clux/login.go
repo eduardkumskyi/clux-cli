@@ -62,6 +62,10 @@ func tokenLogin(cfg *config.Config, backendURL, token string) error {
 	}
 	sess, err := tunnel.Dial(context.Background(), backendURL, token, version, info, nil)
 	if err != nil {
+		if errors.Is(err, tunnel.ErrTokenRejected) {
+			return errors.New("could not verify token: the backend did not accept it (invalid or revoked); " +
+				"create a new one in the dashboard, or run `clux host start` in a terminal to log in with the browser")
+		}
 		return fmt.Errorf("could not verify token: %w", err)
 	}
 	defer sess.Close()

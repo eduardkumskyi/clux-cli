@@ -88,22 +88,29 @@ func runHostStart(args []string) error {
 	if err != nil {
 		return err
 	}
+	login := func(ctx context.Context) error {
+		backend := cfg.BackendURL
+		if backend == "" {
+			backend = defaultBackendURL
+		}
+		_, err := browserLogin(ctx, cfg, backend, os.Stdout)
+		return err
+	}
+	relogin := &reloginOnce{interactive: interactive, login: login, out: os.Stdout}
+	justLoggedIn := false
 	if !cfg.LoggedIn() {
 		switch {
 		case asService:
-			fmt.Fprintln(os.Stderr, "clux: not logged in; waiting for `clux login`")
+			fmt.Fprintln(os.Stderr, "clux: not logged in; waiting for a login (run `clux host start` in a terminal)")
 			if waitForCredentials(ctx, "", func(f string, a ...any) { fmt.Fprintf(os.Stderr, "clux: "+f+"\n", a...) }) {
 				return &exitError{code: exitRestart, err: errors.New("restarting with the new login")}
 			}
 			return nil
 		case interactive:
-			backend := cfg.BackendURL
-			if backend == "" {
-				backend = defaultBackendURL
-			}
-			if _, err := browserLogin(ctx, cfg, backend, os.Stdout); err != nil {
+			if err := login(ctx); err != nil {
 				return err
 			}
+			justLoggedIn = true
 		default:
 			return config.ErrNotLoggedIn
 		}
@@ -157,11 +164,7 @@ func runHostStart(args []string) error {
 	defer logger.Flush()
 	logger.Printf("clux %s starting (log: %s)", version, logPath)
 
-	// macOS: offer the native runtime once (interactive only), or warn if
-	// it is installed but unhealthy. Never blocks docker-only mode.
-	newNativeOffer(cfg, *noNativePrompt, log.Printf).run()
-
-	// Then the background service: asked once (interactive), remembered.
+	// The background service: asked once (interactive), remembered.
 	bg := &backgroundOffer{
 		interactive: interactive,
 		foreground:  *foreground,
@@ -191,6 +194,25 @@ func runHostStart(args []string) error {
 		in:  os.Stdin,
 		out: os.Stdout,
 	}
+
+	// About to hand over to the service: check the stored token here
+	// first, where a rejected one can still be replaced by logging in
+	// again (the service never prompts). A foreground run finds out on
+	// its first register instead.
+	if a := bg.decide(); interactive && !justLoggedIn && (a == bgInstall || a == bgPrompt) {
+		if err := relogin.do(ctx, verifyToken(cfg)); err != nil {
+			if tunnel.IsFatal(err) {
+				logger.Printf("fatal: %v", err)
+				return &exitError{code: exitFatalConfig, err: err}
+			}
+			return err
+		}
+	}
+
+	// macOS: offer the native runtime once (interactive only), or warn if
+	// it is installed but unhealthy. Never blocks docker-only mode.
+	newNativeOffer(cfg, *noNativePrompt, log.Printf).run()
+
 	if bg.run() {
 		logger.Printf("handed over to the background service")
 		return nil
@@ -211,24 +233,42 @@ func runHostStart(args []string) error {
 		h.caps.FreeSlots = nh.runtime.Slots.Free
 	}
 	go h.dispatch(ctx, netwatch.Watch(ctx, netwatch.Options{}))
-	err = h.run(ctx)
+	// h.cfg is cfg: a re-login inside relogin.do hands h the new token.
+	err = relogin.do(ctx, func(ctx context.Context) error {
+		logger.Flush()
+		return h.run(ctx)
+	})
 	if err != nil && tunnel.IsFatal(err) {
 		// Into host.log too, before exiting: after-the-fact diagnosis is the
 		// whole point of the file.
-		logger.Printf("fatal: %v", err)
-		if asService {
-			// Restarting cannot fix this; wait for the user instead of
-			// crash-looping every 10 s.
-			logger.Printf("waiting for `clux login` (or a clux update) before retrying")
+		return fatalExit(ctx, err, asService, logger.Printf, func(ctx context.Context) bool {
 			logger.Flush()
-			if waitForCredentials(ctx, cfg.Token, logger.Printf) {
-				return &exitError{code: exitRestart, err: err}
+			return waitForCredentials(ctx, cfg.Token, logger.Printf)
+		})
+	}
+	return err
+}
+
+// verifyToken registers once with the stored token and hangs up, so a
+// rejected token shows up while the user is still at the terminal. Only
+// fatal errors count; anything else (offline, backend down) is left to the
+// agent's own retries.
+func verifyToken(cfg *config.Config) func(context.Context) error {
+	return func(ctx context.Context) error {
+		info, err := collectInfo()
+		if err != nil {
+			return nil
+		}
+		sess, err := tunnel.Dial(ctx, cfg.BackendURL, cfg.Token, version, info, nil)
+		if err != nil {
+			if tunnel.IsFatal(err) {
+				return err
 			}
 			return nil
 		}
-		return &exitError{code: exitFatalConfig, err: err}
+		_ = sess.Close()
+		return nil
 	}
-	return err
 }
 
 type hostLoop struct {
