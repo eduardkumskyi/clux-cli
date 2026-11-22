@@ -469,3 +469,30 @@ func TestXcodeApp(t *testing.T) {
 		}
 	}
 }
+
+// cfprefsd checks a client's sandbox by path string, spelled through /var
+// ("Path not accessible" for /var/clux/slots/3/Library/Preferences/...):
+// dirs under /private/var are also allowed in their /var spelling.
+func TestSandboxProfileAllowsVarSpellingOfPrivateVar(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("native macOS runtime: POSIX paths, never runs on Windows")
+	}
+	prof, err := SandboxProfile(ProfileParams{
+		WorkspaceDir: "/private/var/clux/slots/3/workspaces/622", AgentHome: "/private/var/clux/slots/3",
+		RuntimeDir: "/private/var/clux-runtime", UserCache: "/private/var/folders/f6/x/C", UserTemp: "/private/var/folders/f6/x/T",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		`(subpath "/var/clux/slots/3/Library")`, `(subpath "/private/var/clux/slots/3/Library")`,
+		`(subpath "/var/clux/slots/3/workspaces/622")`, `(subpath "/var/folders/f6/x/T")`,
+	} {
+		if !strings.Contains(prof, want) {
+			t.Errorf("profile lacks %s", want)
+		}
+	}
+	if strings.Contains(prof, `(subpath "/var/var/`) {
+		t.Error("double /var prefix")
+	}
+}
