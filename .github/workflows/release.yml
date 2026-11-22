@@ -24,13 +24,20 @@ jobs:
           args: release --clean
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # ed25519 seed (base64) that signs checksums.txt; see README
-          # "Release signing".
+      # Signing runs here, not in goreleaser: the release stays a draft until
+      # checksums.txt.sig is uploaded and verifies, so no client ever sees an
+      # unsigned release.
+      - name: Sign checksums.txt
+        env:
+          # ed25519 seed (base64); see README "Release signing".
           CLUX_RELEASE_SIGNING_KEY: ${{ secrets.CLUX_RELEASE_SIGNING_KEY }}
-      - name: Verify the published signature
+        run: go run ./tools/releasesign sign -tag "$GITHUB_REF_NAME" -in dist/checksums.txt -out dist/checksums.txt.sig
+      - name: Upload, verify and publish
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          gh release upload "$GITHUB_REF_NAME" dist/checksums.txt.sig --clobber
           mkdir -p /tmp/sigcheck
           gh release download "$GITHUB_REF_NAME" -D /tmp/sigcheck -p checksums.txt -p checksums.txt.sig
           go run ./tools/releasesign verify -tag "$GITHUB_REF_NAME" -in /tmp/sigcheck/checksums.txt -sig /tmp/sigcheck/checksums.txt.sig
+          gh release edit "$GITHUB_REF_NAME" --draft=false
