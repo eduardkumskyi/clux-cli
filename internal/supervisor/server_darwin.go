@@ -262,7 +262,8 @@ func (s *Server) Serve(ctx context.Context) error {
 			return err
 		}
 	}
-	s.opts.Logf("slot %d (%s) listening on %s (sandbox: %s)", s.slot.N, s.slot.User, s.opts.Socket, s.sandbox)
+	s.opts.Logf("slot %d (%s) listening on %s (sandbox: %s; user temp %s, cache %s)",
+		s.slot.N, s.slot.User, s.opts.Socket, s.sandbox, s.base.UserTemp, s.base.UserCache)
 	go func() {
 		<-ctx.Done()
 		l.Close()
