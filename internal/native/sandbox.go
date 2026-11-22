@@ -136,12 +136,12 @@ func SandboxProfile(p ProfileParams) (string, error) {
 `)
 	b.WriteString(subpaths(p.UserCache))
 	b.WriteString(subpaths(p.UserTemp))
-	// Also by shape, not only by the dirs resolved at supervisor start: a
-	// LaunchDaemon's getconf can miss them (then the explicit rules above
-	// name /private/var/empty and every write here failed). Every per-user
-	// folder's C/T/0/X is drwx------ for its own uid, so file permissions
-	// still keep other slots' and the owner's folders out.
-	b.WriteString("  (regex #\"^/private/var/folders/[^/]+/[^/]+/(C|T|0|X)(/|$)\"))\n")
+	// Also by shape, in case the dirs resolved at supervisor start miss them.
+	// Only C and T: every per-user folder's C/T is drwx------ for its own uid,
+	// so file permissions keep other slots' and the owner's out. Not 0/X:
+	// they are world-readable (drwxr-xr-x), so the shape rule would let the
+	// agent read other users' LaunchServices and code-sign stores.
+	b.WriteString("  (regex #\"^/private/var/folders/[^/]+/[^/]+/(C|T)(/|$)\"))\n")
 
 	b.WriteString(`
 ;; mach services: logging, directory lookups, prefs, TLS trust, and the
@@ -159,6 +159,9 @@ func SandboxProfile(p ProfileParams) (string, error) {
   (global-name "com.apple.trustd.agent")
   (global-name "com.apple.SecurityServer")
   (global-name "com.apple.ocspd")
+  ;; read-only LaunchServices type map: without it xcodebuild can't tell a
+  ;; .xcworkspace is one ("'Runner.xcworkspace' is not a workspace file")
+  (global-name "com.apple.lsd.mapdb")
   (xpc-service-name "com.apple.CoreSimulator.CoreSimulatorService")
   (xpc-service-name "com.apple.CoreSimulator.SimLaunchHost-arm64")
   (xpc-service-name "com.apple.CoreSimulator.SimLaunchHost-x86")
