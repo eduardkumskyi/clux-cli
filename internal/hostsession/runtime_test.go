@@ -67,6 +67,35 @@ func TestDispatchByRuntimeField(t *testing.T) {
 	}
 }
 
+type failingRuntime struct{ fakeRuntime }
+
+func (failingRuntime) Start(context.Context, map[string]any) (map[string]any, error) {
+	return nil, errors.New("docker run failed: docker run -e SIDECAR_HMAC_SECRET=s3cret " +
+		"-e GITHUB_CLONE_URL=https://x-access-token:ghs_1@github.com/o/r img: pull access denied")
+}
+
+// A failure reason goes to host.log and back to the backend: readable,
+// without secrets.
+func TestFailureReplyIsRedacted(t *testing.T) {
+	r := NewResults()
+	h := New(context.Background(), nil, r, Options{Runtimes: map[string]Runtime{RuntimeDocker: failingRuntime{}}})
+	h.HandleCommand(context.Background(), "workspace.start", decode(t, `{"correlation_id":"c1"}`))
+	if len(r.pending) != 1 {
+		t.Fatalf("pending %d", len(r.pending))
+	}
+	res := r.pending[0].frame
+	reason, _ := res["error"].(string)
+	if res["ok"] != false || strings.Contains(reason, "s3cret") || strings.Contains(reason, "ghs_1") {
+		t.Fatalf("result %v", res)
+	}
+	if !strings.Contains(reason, "pull access denied") || !strings.Contains(reason, "SIDECAR_HMAC_SECRET=[REDACTED]") {
+		t.Fatalf("reason lost its meaning: %q", reason)
+	}
+	if long := failureReason(errors.New(strings.Repeat("é", maxReasonBytes))); len(long) > maxReasonBytes+len("…") {
+		t.Fatalf("reason not bounded: %d bytes", len(long))
+	}
+}
+
 func TestNativeUnavailableIsAClearError(t *testing.T) {
 	h := New(context.Background(), nil, nil, Options{})
 	_, err := h.dispatch(context.Background(), "workspace.start", decode(t, `{"runtime":"native_macos","workspace_id":3}`))

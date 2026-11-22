@@ -27,6 +27,7 @@ import (
 
 	"github.com/eduardkumskyi/clux-cli/internal/egress"
 	"github.com/eduardkumskyi/clux-cli/internal/native"
+	"github.com/eduardkumskyi/clux-cli/internal/redact"
 )
 
 const (
@@ -126,6 +127,10 @@ func NewServer(opts Options) (*Server, error) {
 	if opts.Logf == nil {
 		opts.Logf = func(string, ...any) {}
 	}
+	// The supervisor's log is a plain file: mask secrets (an error may
+	// quote the sidecar's log tail or env) before they reach it.
+	logf := opts.Logf
+	opts.Logf = func(format string, args ...any) { logf("%s", redact.String(fmt.Sprintf(format, args...))) }
 	if opts.ShutdownSimulators == nil {
 		home := opts.AgentHome
 		opts.ShutdownSimulators = func(ctx context.Context) error {
@@ -322,7 +327,8 @@ func (s *Server) Dispatch(ctx context.Context, req Request) Response {
 	}
 	if err != nil {
 		s.opts.Logf("%s %s failed: %v", req.Op, req.WorkspaceID, err)
-		return Response{Error: err.Error()}
+		// The reason travels on to the backend: never with a secret in it.
+		return Response{Error: redact.String(err.Error())}
 	}
 	if req.Op != OpStatus {
 		s.opts.Logf("%s %s ok", req.Op, req.WorkspaceID)
