@@ -84,6 +84,11 @@ func TestSandboxProfileEnforced(t *testing.T) {
 	if run("/usr/bin/touch", filepath.Join(home, "plain")) == nil {
 		t.Fatal("a plain file in the account home was writable")
 	}
+	// Preferences are readable (xcodebuild reads its defaults through
+	// cfprefsd); read-only here so the test never changes the developer's.
+	if err := run("/usr/bin/defaults", "read", "NSGlobalDomain"); err != nil {
+		t.Fatalf("preferences not readable in the sandbox: %v", err)
+	}
 	if err := run("/usr/bin/touch", filepath.Join(ws, "new")); err != nil {
 		t.Fatalf("workspace not writable: %v", err)
 	}
