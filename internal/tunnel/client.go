@@ -103,6 +103,26 @@ func errTokenRejected(format string, a ...any) error {
 	return &ErrFatal{&tokenRejected{fmt.Sprintf(format, a...) + " (" + TokenRejectedHint + ")"}}
 }
 
+// Features are the feature flags this CLI advertises in every capabilities
+// payload ("capabilities.features"). The backend gates features that need a
+// newer CLI on these flags, never on the version string, so an older CLI
+// keeps the older behaviour. Add a flag when the CLI learns a new trick the
+// backend must know about.
+var Features = []string{"self_update"}
+
+// UpdateHint tells the user how to update clux.
+const UpdateHint = "run `clux update` (or: curl -fsSL https://clux.space/install.sh | sh)"
+
+// withFeatures is caps plus "features" (a copy; caps is not changed).
+func withFeatures(caps map[string]any) map[string]any {
+	out := make(map[string]any, len(caps)+1)
+	for k, v := range caps {
+		out[k] = v
+	}
+	out["features"] = append([]string(nil), Features...)
+	return out
+}
+
 // ErrSuperseded means another process (same token, maybe another machine)
 // registered this host and the backend dropped us in its favor.
 var ErrSuperseded = errors.New("another process or machine is using this host's token; it replaced this connection")
@@ -116,6 +136,9 @@ type Session struct {
 	conn   *websocket.Conn
 	HostID int64
 	Name   string
+	// LatestVersion is the newest clux release the backend knows of ("0.6.0"),
+	// from the register ack; "" when it didn't say (older backends).
+	LatestVersion string
 
 	// Liveness timings; zero values fall back to the Default* constants.
 	// Exposed so tests can shrink them.
@@ -146,6 +169,9 @@ type registerAck struct {
 	Name       string `json:"name"`
 	Reason     string `json:"reason"`
 	MinVersion string `json:"min_version"`
+	// Newer backends: the latest clux release, for an "update available"
+	// notice.
+	LatestVersion string `json:"latest_version"`
 }
 
 // Dial opens the tunnel connection and performs the register handshake.
@@ -153,7 +179,7 @@ type registerAck struct {
 // done) or for Run (to enter the long-running full-duplex loop). caps, if
 // non-nil, is sent as the register frame's "capabilities" (the runtimes this
 // host offers); backends that predate it ignore the field, and a register
-// without it means docker only.
+// without it means docker only. The capabilities always carry Features.
 func Dial(ctx context.Context, backendURL, token, cliVersion string, info sysinfo.Info, caps map[string]any) (*Session, error) {
 	wsURL, err := toWebsocketURL(backendURL)
 	if err != nil {
@@ -202,9 +228,7 @@ func Dial(ctx context.Context, backendURL, token, cliVersion string, info sysinf
 			frame["machine_secret"] = info.MachineSecret
 		}
 	}
-	if caps != nil {
-		frame["capabilities"] = caps
-	}
+	frame["capabilities"] = withFeatures(caps)
 	_ = conn.SetWriteDeadline(time.Now().Add(DefaultWriteTimeout))
 	if err := conn.WriteJSON(frame); err != nil {
 		conn.Close()
@@ -223,7 +247,7 @@ func Dial(ctx context.Context, backendURL, token, cliVersion string, info sysinf
 			case CloseInvalidToken:
 				return nil, errTokenRejected("registration rejected: invalid or revoked token")
 			case CloseCLIOutdated:
-				return nil, &ErrFatal{fmt.Errorf("registration rejected: this clux version is too old, update it (curl -fsSL https://clux.space/install.sh | sh)")}
+				return nil, &ErrFatal{fmt.Errorf("registration rejected: this clux version is too old; %s", UpdateHint)}
 			}
 		}
 		return nil, fmt.Errorf("reading register response: %w", err)
@@ -234,7 +258,7 @@ func Dial(ctx context.Context, backendURL, token, cliVersion string, info sysinf
 		conn.Close()
 		switch ack.Reason {
 		case "cli_outdated":
-			return nil, &ErrFatal{fmt.Errorf("registration rejected: clux %s is too old (backend needs >= %s); update: curl -fsSL https://clux.space/install.sh | sh", cliVersion, ack.MinVersion)}
+			return nil, &ErrFatal{fmt.Errorf("registration rejected: clux %s is too old (backend needs >= %s); %s", cliVersion, ack.MinVersion, UpdateHint)}
 		case "invalid_token", "revoked":
 			return nil, errTokenRejected("registration rejected (%s): invalid or revoked token", ack.Reason)
 		}
@@ -247,7 +271,9 @@ func Dial(ctx context.Context, backendURL, token, cliVersion string, info sysinf
 	_ = conn.SetReadDeadline(time.Time{})
 	_ = conn.SetWriteDeadline(time.Time{})
 
-	return newSession(conn, ack.HostID, ack.Name), nil
+	sess := newSession(conn, ack.HostID, ack.Name)
+	sess.LatestVersion = ack.LatestVersion
+	return sess, nil
 }
 
 func newSession(conn *websocket.Conn, hostID int64, name string) *Session {
@@ -293,7 +319,7 @@ func heartbeatFrame(info sysinfo.Info, cliVersion string, caps map[string]any) m
 		"cli_version":      cliVersion,
 	}
 	if caps != nil {
-		f["capabilities"] = caps
+		f["capabilities"] = withFeatures(caps)
 	}
 	return f
 }

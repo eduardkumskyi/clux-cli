@@ -94,6 +94,10 @@ func (c *Capabilities) Collect(ctx context.Context) map[string]any {
 		"sandbox":            sandbox,
 		"pf":                 pf,
 		"supervisor_version": version,
+		// The clux version the daemons' own copy of the binary came from
+		// (`sudo clux native install` refreshes it): the backend tells the
+		// owner when it is behind the CLI, even while no supervisor answers.
+		"daemon_version": cfg.CLIVersion,
 		// Each native workspace holds one slot (agent user) while it
 		// exists; with none free, workspace.start fails.
 		"slots_total": total,

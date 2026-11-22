@@ -55,6 +55,8 @@ func main() {
 		err = runDoctor(args)
 	case "version":
 		fmt.Println("clux version", version)
+	case "update":
+		err = runUpdate(args)
 	case "host":
 		if len(args) < 1 {
 			err = fmt.Errorf("usage: clux host <start|stop|status|logs>")
@@ -110,6 +112,8 @@ commands:
   native install [--owner <user>] [--slots N] (macOS, root) set up the native runtime for iOS/Xcode workspaces
   native uninstall [--purge]                  (macOS, root) remove the native runtime
   native status                               show the native runtime's state
+  update [--check] [--version vX.Y.Z]         update clux to the latest release (or the one given),
+                                              restarting the background service; --check only looks
   version                                     print the CLI version`)
 }
 

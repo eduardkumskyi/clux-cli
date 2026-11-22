@@ -69,7 +69,11 @@ func newFakeBackend(t *testing.T, mode string) *fakeBackend {
 			_ = c.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(CloseCLIOutdated, ""))
 			return
 		}
-		_ = c.WriteJSON(map[string]any{"type": "register_ack", "host_id": 6, "name": "test"})
+		ack := map[string]any{"type": "register_ack", "host_id": 6, "name": "test"}
+		if fb.mode == "latest" {
+			ack["latest_version"] = "0.6.0"
+		}
+		_ = c.WriteJSON(ack)
 		switch fb.mode {
 		case "silent":
 			// Never read again: gorilla only answers pings while reading, so
@@ -202,6 +206,9 @@ func TestRegisterRejectedOutdatedIsFatal(t *testing.T) {
 	_, err := Dial(context.Background(), fb.srv.URL, "tok", "0.1.0", sysinfo.Info{}, nil)
 	if !IsFatal(err) {
 		t.Fatalf("want fatal error, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "clux update") || !strings.Contains(err.Error(), "9.9.9") {
+		t.Fatalf("the error must say how to update: %v", err)
 	}
 }
 
