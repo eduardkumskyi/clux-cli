@@ -121,3 +121,38 @@ func TestSandboxProfileEnforced(t *testing.T) {
 		}
 	}
 }
+
+// A supervisor whose getconf failed passes the /private/var/empty
+// fallbacks; the agent's real confstr temp dir must still be writable.
+func TestSandboxProfileAllowsConfstrDirsWithoutResolvedPaths(t *testing.T) {
+	if _, err := os.Stat("/usr/bin/sandbox-exec"); err != nil {
+		t.Skip("no sandbox-exec")
+	}
+	tmp, err := os.MkdirTemp("/private/tmp", "clux-sb-test-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(tmp) })
+	root := resolved(t, tmp)
+	ws, home, rt := filepath.Join(root, "ws"), filepath.Join(root, "home"), filepath.Join(root, "rt")
+	for _, d := range []string{ws, filepath.Join(home, "Library"), rt} {
+		if err := os.MkdirAll(d, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	prof, err := SandboxProfile(ProfileParams{
+		WorkspaceDir: ws, AgentHome: home, RuntimeDir: rt,
+		UserCache: "/private/var/empty/cache", UserTemp: "/private/var/empty/temp",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pf := filepath.Join(root, "p.sb")
+	os.WriteFile(pf, []byte(prof), 0o600)
+	probe := filepath.Join(getconf(t, "DARWIN_USER_TEMP_DIR"), filepath.Base(root)+".probe")
+	t.Cleanup(func() { os.Remove(probe) })
+	out, err := exec.Command("/usr/bin/sandbox-exec", "-f", pf, "/usr/bin/touch", probe).CombinedOutput()
+	if err != nil {
+		t.Fatalf("confstr temp dir not writable with fallback params: %v %s", err, out)
+	}
+}

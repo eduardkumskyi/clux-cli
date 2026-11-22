@@ -117,7 +117,13 @@ func SandboxProfile(p ProfileParams) (string, error) {
 (allow file-read* file-write*
 `)
 	fmt.Fprintf(&b, "  (subpath %s)\n", q(p.UserCache))
-	fmt.Fprintf(&b, "  (subpath %s))\n", q(p.UserTemp))
+	fmt.Fprintf(&b, "  (subpath %s)\n", q(p.UserTemp))
+	// Also by shape, not only by the dirs resolved at supervisor start: a
+	// LaunchDaemon's getconf can miss them (then the explicit rules above
+	// name /private/var/empty and every write here failed). Every per-user
+	// folder's C/T/0/X is drwx------ for its own uid, so file permissions
+	// still keep other slots' and the owner's folders out.
+	b.WriteString("  (regex #\"^/private/var/folders/[^/]+/[^/]+/(C|T|0|X)(/|$)\"))\n")
 
 	b.WriteString(`
 ;; mach services: logging, directory lookups, prefs, TLS trust, and the
