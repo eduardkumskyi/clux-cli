@@ -36,6 +36,8 @@ func TestMain(m *testing.M) {
 		time.Sleep(10 * time.Minute)
 		return
 	}
+	// Tests run as the developer: never touch their own Xcode defaults.
+	disableManifestSandbox = func() ([]byte, error) { return nil, nil }
 	os.Exit(m.Run())
 }
 

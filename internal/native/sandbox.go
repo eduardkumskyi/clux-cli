@@ -105,6 +105,11 @@ func SandboxProfile(p ProfileParams) (string, error) {
 `)
 	fmt.Fprintf(&b, "  (subpath %s)\n", q(p.WorkspaceDir))
 	fmt.Fprintf(&b, "  (subpath %s)\n", q(lib))
+	// Dot entries of the account's real home (~/.config/flutter, ~/.pub-cache,
+	// ...): Xcode runs build-phase scripts with HOME from the account, not
+	// the workspace's. The slot home is this slot's alone and wiped on
+	// handover; its other entries (workspaces/, Library/) keep their rules.
+	fmt.Fprintf(&b, "  (regex #\"^%s/\\.[^/]+(/|$)\")\n", regexp.QuoteMeta(p.AgentHome))
 	b.WriteString(`  (literal "/dev/null") (literal "/dev/tty") (literal "/dev/dtracehelper")
   (literal "/dev/ptmx") (regex #"^/dev/ttys[0-9]+$"))
 (allow file-ioctl
