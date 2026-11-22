@@ -15,6 +15,7 @@ import (
 
 	"github.com/eduardkumskyi/clux-cli/internal/dialproxy"
 	"github.com/eduardkumskyi/clux-cli/internal/egress"
+	"github.com/eduardkumskyi/clux-cli/internal/redact"
 	"github.com/eduardkumskyi/clux-cli/internal/tunnel"
 )
 
@@ -81,9 +82,10 @@ func (h *Handler) HandleCommand(_ context.Context, frameType string, frame map[s
 		// result frame sent back to the backend, and the operator watching
 		// `clux host start` sees nothing while the dashboard shows a generic
 		// "Workspace failed to start".
-		log.Printf("command %s failed: %v", frameType, err)
+		reason := failureReason(err)
+		log.Printf("command %s failed: %s", frameType, reason)
 		result["ok"] = false
-		result["error"] = err.Error()
+		result["error"] = reason
 	} else {
 		if !strings.HasPrefix(frameType, "egress.") {
 			log.Printf("command %s ok", frameType)
@@ -170,6 +172,20 @@ func (h *Handler) HandleDialData(streamID string, dataB64 string) {
 // HandleDialClose implements tunnel.Handler.
 func (h *Handler) HandleDialClose(streamID string) {
 	h.dials.Close(streamID)
+}
+
+// maxReasonBytes bounds a failure reason sent to the backend (it shows it
+// to the user); room for the native runtime's sidecar log tail.
+const maxReasonBytes = 4096
+
+// failureReason is what a failed command reports, to host.log and to the
+// backend: the error text with secrets masked, bounded in size.
+func failureReason(err error) string {
+	s := redact.String(err.Error())
+	if len(s) > maxReasonBytes {
+		s = strings.ToValidUTF8(s[:maxReasonBytes], "") + "…"
+	}
+	return s
 }
 
 func stringField(frame map[string]any, key string) string {

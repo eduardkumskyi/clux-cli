@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sync"
 )
 
 // Answers to the background-service offer in `clux host start`.
@@ -40,6 +41,40 @@ func (c *Config) LoggedIn() bool { return c != nil && c.Token != "" }
 // the user's answers to the one-time questions.
 func (c *Config) ClearCredentials() {
 	c.Token, c.HostName, c.HostID = "", "", 0
+}
+
+// Credentials is the one live copy of a running host's backend URL and
+// token. Everything in `clux host start` that talks to the backend (the
+// tunnel, the native sidecar bundle download) reads it at call time, never
+// a copy taken at startup, so a re-login (a rejected token replaced
+// mid-run) reaches all of them at once. Safe for concurrent use.
+type Credentials struct {
+	mu         sync.RWMutex
+	backendURL string
+	token      string
+}
+
+// NewCredentials holds cfg's current backend URL and token.
+func NewCredentials(cfg *Config) *Credentials {
+	c := &Credentials{}
+	if cfg != nil {
+		c.backendURL, c.token = cfg.BackendURL, cfg.Token
+	}
+	return c
+}
+
+// Get returns the current backend URL and token.
+func (c *Credentials) Get() (backendURL, token string) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.backendURL, c.token
+}
+
+// Set replaces them (after a login).
+func (c *Credentials) Set(backendURL, token string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.backendURL, c.token = backendURL, token
 }
 
 func dir() (string, error) {

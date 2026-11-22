@@ -1,7 +1,10 @@
 // Package logx is a tiny line logger for `clux host start`: every line is
 // timestamped, and a run of identical messages (the same reconnect error
 // every few seconds during an outage) collapses into one line plus a
-// "(repeated N×)" summary when something different happens.
+// "(repeated N×)" summary when something different happens. Secrets
+// (sensitive KEY=VALUE pairs, URL passwords, bearer tokens) are masked in
+// every line before it is written (package redact), as a last line of
+// defense for whatever a caller formats into a message.
 package logx
 
 import (
@@ -9,6 +12,8 @@ import (
 	"io"
 	"sync"
 	"time"
+
+	"github.com/eduardkumskyi/clux-cli/internal/redact"
 )
 
 // Logger is safe for concurrent use.
@@ -36,7 +41,7 @@ func (l *Logger) flushLocked() {
 
 // Printf always prints (after flushing a pending repeat count).
 func (l *Logger) Printf(format string, args ...any) {
-	msg := fmt.Sprintf(format, args...)
+	msg := redact.String(fmt.Sprintf(format, args...))
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	l.flushLocked()
@@ -47,7 +52,7 @@ func (l *Logger) Printf(format string, args ...any) {
 // Repeatable prints msg unless it equals the previous Repeatable message, in
 // which case it is only counted.
 func (l *Logger) Repeatable(format string, args ...any) {
-	msg := fmt.Sprintf(format, args...)
+	msg := redact.String(fmt.Sprintf(format, args...))
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if msg == l.last {

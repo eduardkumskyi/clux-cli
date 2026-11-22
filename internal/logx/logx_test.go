@@ -69,3 +69,17 @@ func TestRotatingFile(t *testing.T) {
 		t.Fatal("kept more files than Keep")
 	}
 }
+
+func TestSecretsAreMasked(t *testing.T) {
+	var b bytes.Buffer
+	l := New(&b).WithClock(fixed)
+	l.Printf("command workspace.start failed: docker run -e SIDECAR_HMAC_SECRET=%s img", "s3cret")
+	l.Repeatable("proxy http://ws-1:%s@127.0.0.1:7777 down", "pw")
+	out := b.String()
+	if strings.Contains(out, "s3cret") || strings.Contains(out, ":pw@") {
+		t.Fatalf("secret in log:\n%s", out)
+	}
+	if !strings.Contains(out, "SIDECAR_HMAC_SECRET=[REDACTED] img") || !strings.Contains(out, "http://ws-1:[REDACTED]@127.0.0.1:7777") {
+		t.Fatalf("redacted lines lost their context:\n%s", out)
+	}
+}

@@ -96,7 +96,7 @@ func TestConcurrentStartsOnSameContainerAreSerialized(t *testing.T) {
 	// must not interleave with the other's.
 	var seq []string
 	for _, c := range f.calls {
-		if strings.HasPrefix(c, "network") {
+		if strings.HasPrefix(c, "network") || strings.HasPrefix(c, "image") {
 			continue
 		}
 		seq = append(seq, strings.Fields(c)[0])

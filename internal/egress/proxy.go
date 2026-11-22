@@ -307,14 +307,18 @@ func (p *Proxy) Decide(id, requestID, decision, host string) {
 			w.denied[host] = p.now().Add(denyTTL)
 		}
 	}
-	if pr != nil {
-		p.resolveLocked(pr, decision)
-	}
 	p.mu.Unlock()
+	// Persist before releasing the held connection: once it proceeds, the
+	// allow_project must already survive a restart.
 	if save != nil {
 		if err := p.saveState(id, *save); err != nil {
 			p.logf("egress: saving policy for workspace %s: %v", id, err)
 		}
+	}
+	if pr != nil {
+		p.mu.Lock()
+		p.resolveLocked(pr, decision)
+		p.mu.Unlock()
 	}
 }
 

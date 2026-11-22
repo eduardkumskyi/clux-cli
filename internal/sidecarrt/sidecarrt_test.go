@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -156,8 +157,9 @@ func testInstaller(t *testing.T) (*Installer, *httptest.Server, *atomic.Value, [
 		}
 	}))
 	t.Cleanup(srv.Close)
+	backend := srv.URL
 	i := &Installer{
-		Root: t.TempDir(), BackendURL: srv.URL, Token: "pat-123",
+		Root: t.TempDir(), Credentials: func() (string, string) { return backend, "pat-123" },
 		UVURL: srv.URL + "/uv.tar.gz", UVSHA256: shaHex(uvTar), Logf: t.Logf,
 	}
 	return i, srv, &lastAuth, bundle
@@ -227,13 +229,42 @@ func TestTokenOnlySentToBackendOrigin(t *testing.T) {
 	i, srv, lastAuth, bundle := testInstaller(t)
 	var calls []string
 	i.run = fakeUV(&calls)
-	i.BackendURL = "https://api.clux.space"
+	i.Credentials = func() (string, string) { return "https://api.clux.space", "pat-123" }
 	b := Bundle{Version: "v1", SHA256: shaHex(bundle), URL: srv.URL + "/bundle.tar.gz"}
 	if _, err := i.Ensure(context.Background(), b, nil); err != nil {
 		t.Fatal(err)
 	}
 	if got := lastAuth.Load(); got != "" {
 		t.Fatalf("PAT sent to a foreign origin: %q", got)
+	}
+}
+
+// The token is read at download time: a re-login that replaces it reaches
+// the next download, no copy of the old one survives.
+func TestDownloadUsesCurrentToken(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("native macOS runtime: POSIX paths, never runs on Windows")
+	}
+	i, srv, lastAuth, bundle := testInstaller(t)
+	var calls []string
+	i.run = fakeUV(&calls)
+	var mu sync.Mutex
+	token := "old-pat"
+	i.Credentials = func() (string, string) { mu.Lock(); defer mu.Unlock(); return srv.URL, token }
+	if _, err := i.Ensure(context.Background(), Bundle{Version: "v1", SHA256: shaHex(bundle), URL: srv.URL + "/bundle.tar.gz"}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if got := lastAuth.Load(); got != "Bearer old-pat" {
+		t.Fatalf("first download auth = %q", got)
+	}
+	mu.Lock()
+	token = "new-pat"
+	mu.Unlock()
+	if _, err := i.Ensure(context.Background(), Bundle{Version: "v2", SHA256: shaHex(bundle), URL: srv.URL + "/bundle.tar.gz"}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if got := lastAuth.Load(); got != "Bearer new-pat" {
+		t.Fatalf("download after re-login auth = %q, want the new token", got)
 	}
 }
 
