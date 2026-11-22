@@ -169,6 +169,11 @@ func TestKeeperReportsBusyDuringWipe(t *testing.T) {
 		if err == nil && st.Busy {
 			break
 		}
+		select {
+		case werr := <-done:
+			t.Fatalf("wipe returned before the slot showed busy: %v", werr)
+		default:
+		}
 		if time.Now().After(deadline) {
 			t.Fatalf("never busy: %+v %v", st, err)
 		}
