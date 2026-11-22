@@ -162,7 +162,8 @@ func TestReplaceSwapsTheFileAndLeavesNoTemp(t *testing.T) {
 	}
 	data, _ := os.ReadFile(exe)
 	st, _ := os.Stat(exe)
-	if string(data) != "new" || st.Mode().Perm() != 0o755 {
+	// Windows has no exec bits: only the content is meaningful there.
+	if string(data) != "new" || runtime.GOOS != "windows" && st.Mode().Perm() != 0o755 {
 		t.Fatalf("got %q mode %v", data, st.Mode())
 	}
 	entries, _ := os.ReadDir(dir)
