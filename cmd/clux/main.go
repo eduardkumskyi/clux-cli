@@ -13,15 +13,14 @@ package main
 import (
 	"context"
 	"errors"
-	"flag"
 	"fmt"
+	"net/http"
 	"os"
 	"os/exec"
 	"strings"
 	"time"
 
 	"github.com/eduardkumskyi/clux-cli/internal/config"
-	"github.com/eduardkumskyi/clux-cli/internal/sysinfo"
 	"github.com/eduardkumskyi/clux-cli/internal/tunnel"
 )
 
@@ -58,12 +57,18 @@ func main() {
 		fmt.Println("clux version", version)
 	case "host":
 		if len(args) < 1 {
-			err = fmt.Errorf("usage: clux host <start>")
+			err = fmt.Errorf("usage: clux host <start|stop|status|logs>")
 			break
 		}
 		switch args[0] {
 		case "start":
 			err = runHostStart(args[1:])
+		case "stop":
+			err = runHostStop(args[1:])
+		case "status":
+			err = runHostStatus(args[1:])
+		case "logs":
+			err = runHostLogs(args[1:])
 		default:
 			err = fmt.Errorf("unknown host subcommand %q", args[0])
 		}
@@ -91,55 +96,21 @@ func printUsage() {
 	fmt.Fprintln(os.Stderr, `usage: clux <command> [flags]
 
 commands:
-  login --token <PAT> [--backend-url <url>]   store credentials, verified against the backend
-  logout                                      remove stored credentials
+  login [--backend-url <url>]                 connect this computer: confirm a code in the browser
+  login --token <PAT> [--backend-url <url>]   connect with a token from the dashboard (servers/CI)
+  logout                                      stop the background service and remove stored credentials
   whoami                                      show the identity of the currently configured host
   doctor                                      check local environment (docker, config, connectivity)
-  host start [--interval <duration>] [--no-native-prompt]
-                                              connect and keep this host registered (foreground)
+  host start [--foreground | --background] [--interval <duration>] [--no-native-prompt]
+                                              keep this computer online; in a terminal it offers
+                                              (once) to run in the background, starting at login
+  host stop                                   stop the background service (and keep it from starting at login)
+  host status                                 background service, connected host, backend, native runtime
+  host logs [-f] [-n N]                       print (or follow) ~/.clux/logs/host.log
   native install [--owner <user>] [--slots N] (macOS, root) set up the native runtime for iOS/Xcode workspaces
   native uninstall [--purge]                  (macOS, root) remove the native runtime
   native status                               show the native runtime's state
   version                                     print the CLI version`)
-}
-
-func runLogin(args []string) error {
-	fs := flag.NewFlagSet("login", flag.ExitOnError)
-	token := fs.String("token", "", "personal access token issued for this host (required)")
-	backendURL := fs.String("backend-url", defaultBackendURL, "backend base URL")
-	if err := fs.Parse(args); err != nil {
-		return err
-	}
-	if *token == "" {
-		return fmt.Errorf("--token is required (create a host and copy its token from the Clux dashboard)")
-	}
-
-	info, err := sysinfo.Collect(config.DefaultStorageRoot())
-	if err != nil {
-		return fmt.Errorf("collecting system info: %w", err)
-	}
-
-	sess, err := tunnel.Dial(context.Background(), *backendURL, *token, version, info, nil)
-	if err != nil {
-		return fmt.Errorf("could not verify token: %w", err)
-	}
-	defer sess.Close()
-
-	cfg := &config.Config{BackendURL: *backendURL, Token: *token, HostName: sess.Name}
-	if err := config.Save(cfg); err != nil {
-		return fmt.Errorf("saving credentials: %w", err)
-	}
-
-	fmt.Printf("Logged in as host %q (id=%d)\n", sess.Name, sess.HostID)
-	return nil
-}
-
-func runLogout(args []string) error {
-	if err := config.Remove(); err != nil {
-		return fmt.Errorf("removing credentials: %w", err)
-	}
-	fmt.Println("Logged out.")
-	return nil
 }
 
 func runWhoami(args []string) error {
@@ -147,9 +118,16 @@ func runWhoami(args []string) error {
 	if err != nil {
 		return err
 	}
-	info, err := sysinfo.Collect(config.DefaultStorageRoot())
+	// A register would replace the running agent's tunnel (the backend keeps
+	// one per host): answer from local state instead.
+	if who, live := liveAgent(); live {
+		fmt.Printf("host %q (id=%d) backend=%s (from local config; %s holds the connection, see `clux host status`)\n",
+			cfg.HostName, cfg.HostID, cfg.BackendURL, who)
+		return nil
+	}
+	info, err := collectInfo()
 	if err != nil {
-		return fmt.Errorf("collecting system info: %w", err)
+		return err
 	}
 
 	sess, err := tunnel.Dial(context.Background(), cfg.BackendURL, cfg.Token, version, info, nil)
@@ -159,6 +137,52 @@ func runWhoami(args []string) error {
 	defer sess.Close()
 
 	fmt.Printf("host %q (id=%d) backend=%s\n", sess.Name, sess.HostID, cfg.BackendURL)
+	return nil
+}
+
+// liveAgent reports whether a `clux host start` (background service or a
+// terminal) is running on this machine, and which.
+func liveAgent() (string, bool) {
+	return describeLiveAgent(
+		func() (int, bool) {
+			if svc, err := newService(); err == nil && svc.Supported() {
+				if st, err := svc.Status(); err == nil && st.Running {
+					return st.PID, true
+				}
+			}
+			return 0, false
+		},
+		func() (int, bool) {
+			dir, err := config.Dir()
+			if err != nil {
+				return 0, false
+			}
+			pid, held, _ := hostlockHolder(dir)
+			return pid, held
+		})
+}
+
+// describeLiveAgent checks the service first (to name it), then the host
+// lock, which any running `clux host start` holds.
+func describeLiveAgent(service, lock func() (int, bool)) (string, bool) {
+	if pid, ok := service(); ok {
+		return fmt.Sprintf("the background service (pid %d)", pid), true
+	}
+	if pid, ok := lock(); ok {
+		return fmt.Sprintf("`clux host start` (pid %d)", pid), true
+	}
+	return "", false
+}
+
+// backendReachable is a connectivity check that does not register: any
+// HTTP answer from the backend counts.
+func backendReachable(backendURL string) error {
+	c := &http.Client{Timeout: 10 * time.Second}
+	resp, err := c.Get(strings.TrimRight(backendURL, "/") + "/")
+	if err != nil {
+		return err
+	}
+	resp.Body.Close()
 	return nil
 }
 
@@ -180,9 +204,13 @@ func runDoctor(args []string) error {
 	check("credentials configured", cfgErr)
 
 	if cfgErr == nil {
-		info, infoErr := sysinfo.Collect(config.DefaultStorageRoot())
+		info, infoErr := collectInfo()
 		check("system info collection", infoErr)
-		if infoErr == nil {
+		if who, live := liveAgent(); live {
+			// Registering again would replace the live tunnel.
+			check(fmt.Sprintf("backend reachable (credentials not re-checked: %s is connected with them)", who),
+				backendReachable(cfg.BackendURL))
+		} else if infoErr == nil {
 			sess, dialErr := tunnel.Dial(context.Background(), cfg.BackendURL, cfg.Token, version, info, nil)
 			check("backend connectivity", dialErr)
 			if dialErr == nil {

@@ -29,6 +29,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -168,6 +169,18 @@ func Dial(ctx context.Context, backendURL, token, cliVersion string, info sysinf
 		"memory_mb":        info.MemoryMB,
 		"storage_gb_total": info.StorageGBTotal,
 		"cli_version":      cliVersion,
+		// Informational, shown in the dashboard ("macOS, Apple silicon").
+		"os":   runtime.GOOS,
+		"arch": runtime.GOARCH,
+	}
+	// machine_id lets the backend recognize this computer as the same host
+	// across logins (one machine = one host). Older backends ignore it.
+	// machine_secret proves the id belongs to this computer.
+	if info.MachineID != "" {
+		frame["machine_id"] = info.MachineID
+		if info.MachineSecret != "" {
+			frame["machine_secret"] = info.MachineSecret
+		}
 	}
 	if caps != nil {
 		frame["capabilities"] = caps
@@ -188,7 +201,7 @@ func Dial(ctx context.Context, backendURL, token, cliVersion string, info sysinf
 		if errors.As(err, &ce) {
 			switch ce.Code {
 			case CloseInvalidToken:
-				return nil, &ErrFatal{fmt.Errorf("registration rejected: invalid or revoked token (run `clux login --token ...` with a new token)")}
+				return nil, &ErrFatal{fmt.Errorf("registration rejected: invalid or revoked token (run `clux login` to connect this computer again)")}
 			case CloseCLIOutdated:
 				return nil, &ErrFatal{fmt.Errorf("registration rejected: this clux version is too old, update it (curl -fsSL https://clux.space/install.sh | sh)")}
 			}
@@ -203,7 +216,7 @@ func Dial(ctx context.Context, backendURL, token, cliVersion string, info sysinf
 		case "cli_outdated":
 			return nil, &ErrFatal{fmt.Errorf("registration rejected: clux %s is too old (backend needs >= %s); update: curl -fsSL https://clux.space/install.sh | sh", cliVersion, ack.MinVersion)}
 		case "invalid_token", "revoked":
-			return nil, &ErrFatal{fmt.Errorf("registration rejected: %s (run `clux login --token ...` with a new token)", ack.Reason)}
+			return nil, &ErrFatal{fmt.Errorf("registration rejected: %s (run `clux login` to connect this computer again)", ack.Reason)}
 		}
 		// Unknown reason: may be transient (backend-side), retry with backoff.
 		return nil, fmt.Errorf("registration rejected: %s", ack.Reason)

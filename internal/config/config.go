@@ -4,18 +4,42 @@ package config
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 )
+
+// Answers to the background-service offer in `clux host start`.
+const (
+	ServiceYes = "yes"
+	ServiceNo  = "no"
+)
+
+// ErrNotLoggedIn: no stored token.
+var ErrNotLoggedIn = errors.New("not logged in (run 'clux login' first)")
 
 type Config struct {
 	BackendURL string `json:"backend_url"`
 	Token      string `json:"token"`
 	HostName   string `json:"host_name,omitempty"`
+	HostID     int64  `json:"host_id,omitempty"`
 	// NativePromptDeclined records a "no" to the native macOS runtime offer
 	// in `clux host start`, so it is not asked again.
 	NativePromptDeclined bool `json:"native_prompt_declined,omitempty"`
+	// Service is the answer to "keep this computer online in the
+	// background?" (ServiceYes/ServiceNo); empty = not asked yet.
+	Service string `json:"service,omitempty"`
+}
+
+// LoggedIn reports whether credentials are stored.
+func (c *Config) LoggedIn() bool { return c != nil && c.Token != "" }
+
+// ClearCredentials forgets the host (logout) but keeps the backend URL and
+// the user's answers to the one-time questions.
+func (c *Config) ClearCredentials() {
+	c.Token, c.HostName, c.HostID = "", "", 0
 }
 
 func dir() (string, error) {
@@ -46,7 +70,21 @@ func DefaultStorageRoot() string {
 	return filepath.Join(home, ".clux", "storage")
 }
 
+// Load returns the stored config, or ErrNotLoggedIn without a token.
 func Load() (*Config, error) {
+	cfg, err := Read()
+	if err != nil {
+		return nil, err
+	}
+	if !cfg.LoggedIn() {
+		return nil, ErrNotLoggedIn
+	}
+	return cfg, nil
+}
+
+// Read returns the stored config, logged in or not (an empty one if there
+// is no file yet).
+func Read() (*Config, error) {
 	p, err := path()
 	if err != nil {
 		return nil, err
@@ -54,7 +92,7 @@ func Load() (*Config, error) {
 	data, err := os.ReadFile(p)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return nil, fmt.Errorf("not logged in (run 'clux login' first)")
+			return &Config{}, nil
 		}
 		return nil, err
 	}
@@ -83,7 +121,31 @@ func Save(cfg *Config) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(p, data, 0o600)
+	// Atomic: the service may read the file while `clux login` writes it,
+	// and a crash mid-write must not leave half a config. The temp file is
+	// created 0600 in the same directory (rename stays on one filesystem),
+	// so an older, looser file is replaced with 0600 too.
+	tmp, err := os.CreateTemp(d, ".config.json.tmp*")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(tmp.Name())
+	if err := tmp.Chmod(0o600); err != nil && runtime.GOOS != "windows" {
+		tmp.Close()
+		return err
+	}
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmp.Name(), p)
 }
 
 func Remove() error {
