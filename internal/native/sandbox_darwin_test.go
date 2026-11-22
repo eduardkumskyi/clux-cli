@@ -76,6 +76,14 @@ func TestSandboxProfileEnforced(t *testing.T) {
 	if err := run("/bin/cat", filepath.Join(ws, "mine")); err != nil {
 		t.Fatalf("workspace file not readable: %v", err)
 	}
+	// Xcode build scripts see the account home: its dot entries are writable,
+	// the rest of it is not.
+	if err := run("/bin/mkdir", "-p", filepath.Join(home, ".config", "flutter")); err != nil {
+		t.Fatalf("home dot dir not writable: %v", err)
+	}
+	if run("/usr/bin/touch", filepath.Join(home, "plain")) == nil {
+		t.Fatal("a plain file in the account home was writable")
+	}
 	if err := run("/usr/bin/touch", filepath.Join(ws, "new")); err != nil {
 		t.Fatalf("workspace not writable: %v", err)
 	}

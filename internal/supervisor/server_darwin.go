@@ -221,6 +221,13 @@ func (s *Server) gitTemplateDir() string {
 // its own home; root never does this -- and copies the shared simulator
 // SDK mapping into Library (xcodebuild finds no simulator destination for
 // a fresh account without it).
+// disableManifestSandbox sets the slot user's Xcode default (a variable so
+// tests, which run as the developer, don't change their own Xcode).
+var disableManifestSandbox = func() ([]byte, error) {
+	return exec.Command("/usr/bin/defaults", "write", "com.apple.dt.Xcode",
+		"IDEPackageSupportDisableManifestSandbox", "-bool", "YES").CombinedOutput()
+}
+
 func (s *Server) prepareHome() error {
 	lib := s.libraryDir()
 	for _, d := range []string{
@@ -231,6 +238,14 @@ func (s *Server) prepareHome() error {
 		if err := os.MkdirAll(d, 0o700); err != nil {
 			return err
 		}
+	}
+	// SwiftPM compiles package manifests in a nested sandbox-exec, which
+	// macOS refuses inside the workspace's sandbox ("sandbox_apply:
+	// Operation not permitted"); the manifest still runs inside that outer
+	// sandbox. The agent can't write Xcode's defaults from in there, so set
+	// it here, as the slot user and outside the sandbox. Best effort.
+	if out, err := disableManifestSandbox(); err != nil {
+		s.opts.Logf("disabling the nested SwiftPM manifest sandbox: %v %s", err, bytes.TrimSpace(out))
 	}
 	data, err := os.ReadFile(s.opts.SimMapping)
 	if err != nil {
