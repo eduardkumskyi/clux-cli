@@ -96,6 +96,7 @@ func (n *NativeRuntime) Start(ctx context.Context, frame map[string]any) (map[st
 		HMACSecret:     secret,
 		GithubCloneURL: stringField(frame, "github_clone_url"),
 		ProxyURL:       n.Egress.URL(id, n.ProxyPort),
+		BackendURL:     backendURLField(frame),
 		Runtime: &supervisor.RuntimeSpec{
 			Version: rt.Version, Dir: rt.Dir, Python: rt.Python, Sidecar: rt.Sidecar, Claude: rt.Claude,
 		},

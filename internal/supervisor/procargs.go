@@ -67,6 +67,7 @@ type SidecarEnvParams struct {
 	HMACSecret     string
 	GithubCloneURL string
 	ProxyURL       string
+	BackendURL     string
 	Runtime        RuntimeSpec
 	DeveloperDir   string
 	CPUCount       int
@@ -127,7 +128,27 @@ func SidecarEnv(p SidecarEnvParams) []string {
 	if p.GithubCloneURL != "" {
 		env = append(env, "GITHUB_CLONE_URL="+p.GithubCloneURL)
 	}
+	if ValidBackendURL(p.BackendURL) {
+		// Where the sidecar forwards the agent's host-command requests.
+		// CLUX_WORKSPACE_ID mirrors the docker runtime (which has no
+		// WORKSPACE_ID); the sidecar reads it first.
+		env = append(env, "CLUX_BACKEND_URL="+p.BackendURL, "CLUX_WORKSPACE_ID="+p.WorkspaceID)
+	}
 	return env
+}
+
+// ValidBackendURL reports whether raw is a plain http(s) URL with a host
+// and no credentials, query or fragment: fit to become the sidecar's
+// CLUX_BACKEND_URL.
+func ValidBackendURL(raw string) bool {
+	if raw == "" || len(raw) > 2048 || strings.ContainsAny(raw, "\x00\r\n\t ") {
+		return false
+	}
+	u, err := url.Parse(raw)
+	if err != nil || u.User != nil || u.Host == "" || u.RawQuery != "" || u.Fragment != "" {
+		return false
+	}
+	return u.Scheme == "https" || u.Scheme == "http"
 }
 
 // validProxyURL checks the proxy URL the owner sent points at the

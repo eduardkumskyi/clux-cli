@@ -108,7 +108,18 @@ func errTokenRejected(format string, a ...any) error {
 // newer CLI on these flags, never on the version string, so an older CLI
 // keeps the older behaviour. Add a flag when the CLI learns a new trick the
 // backend must know about.
-var Features = []string{"self_update"}
+//
+// host_exec: runs owner-approved host_exec.run commands (internal/hostexec);
+// POSIX only.
+var Features = features()
+
+func features() []string {
+	f := []string{"self_update"}
+	if runtime.GOOS != "windows" {
+		f = append(f, "host_exec")
+	}
+	return f
+}
 
 // UpdateHint tells the user how to update clux.
 const UpdateHint = "run `clux update` (or: curl -fsSL https://clux.space/install.sh | sh)"

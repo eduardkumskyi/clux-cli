@@ -18,6 +18,7 @@ import (
 	"github.com/eduardkumskyi/clux-cli/internal/backoff"
 	"github.com/eduardkumskyi/clux-cli/internal/config"
 	"github.com/eduardkumskyi/clux-cli/internal/egress"
+	"github.com/eduardkumskyi/clux-cli/internal/hostexec"
 	"github.com/eduardkumskyi/clux-cli/internal/hostlock"
 	"github.com/eduardkumskyi/clux-cli/internal/hostsession"
 	"github.com/eduardkumskyi/clux-cli/internal/logx"
@@ -312,6 +313,9 @@ type hostLoop struct {
 	interval time.Duration
 	log      *logx.Logger
 	results  *hostsession.Results
+	// execResults carries host_exec.result frames across sessions (a host
+	// command can run for many minutes and outlive several reconnects).
+	execResults *hostsession.Results
 	// opts are the workspace runtimes + egress proxy every session's
 	// handler dispatches to; caps describes them in register/heartbeat.
 	opts  hostsession.Options
@@ -334,14 +338,22 @@ type hostLoop struct {
 }
 
 func newHostLoop(creds *config.Credentials, interval time.Duration, l *logx.Logger) *hostLoop {
-	return &hostLoop{
-		creds:    creds,
-		interval: interval,
-		log:      l,
-		results:  hostsession.NewResults(),
-		caps:     &native.Capabilities{},
-		wake:     make(chan struct{}, 1),
+	execResults := hostsession.NewResults()
+	execResults.TTL = 30 * time.Minute
+	execResults.Max = 50
+	h := &hostLoop{
+		creds:       creds,
+		interval:    interval,
+		log:         l,
+		results:     hostsession.NewResults(),
+		execResults: execResults,
+		caps:        &native.Capabilities{},
+		wake:        make(chan struct{}, 1),
 	}
+	executor := hostexec.New(execResults.Deliver)
+	executor.Logf = l.Printf
+	h.opts.HostExec = executor
+	return h
 }
 
 // capsKey makes capabilities comparable, so heartbeats carry them only when
@@ -541,6 +553,9 @@ func (h *hostLoop) session(ctx context.Context) (lived time.Duration, immediate 
 	if n := h.results.Attach(sess); n > 0 {
 		h.log.Printf("re-sent %d command result(s) from the previous connection", n)
 	}
+	if n := h.execResults.Attach(sess); n > 0 {
+		h.log.Printf("re-sent %d host command result(s) from the previous connection", n)
+	}
 	handler := hostsession.New(ctx, sess, h.results, h.opts)
 	h.setCurrent(sess)
 	if h.proxy != nil {
@@ -552,6 +567,7 @@ func (h *hostLoop) session(ctx context.Context) (lived time.Duration, immediate 
 	}
 	h.setCurrent(nil)
 	h.results.Detach(sess)
+	h.execResults.Detach(sess)
 	handler.Close()
 
 	lived = time.Since(registeredAt)

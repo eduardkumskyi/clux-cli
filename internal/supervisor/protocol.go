@@ -53,6 +53,7 @@ type Request struct {
 	HMACSecret     string       `json:"hmac_secret,omitempty"`
 	GithubCloneURL string       `json:"github_clone_url,omitempty"`
 	ProxyURL       string       `json:"proxy_url,omitempty"`
+	BackendURL     string       `json:"backend_url,omitempty"`
 	Runtime        *RuntimeSpec `json:"runtime,omitempty"`
 }
 
