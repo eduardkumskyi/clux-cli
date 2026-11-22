@@ -132,12 +132,14 @@ type Runtime struct {
 // Installer installs runtimes under Root.
 type Installer struct {
 	Root string
-	// BackendURL + Token authenticate the bundle download. The token is only
-	// sent when the bundle URL has the backend's own origin.
-	BackendURL string
-	Token      string
-	Keep       int
-	Logf       func(format string, args ...any)
+	// Credentials returns the backend URL + token that authenticate the
+	// bundle download, read at download time (never copied: a re-login in
+	// `clux host start` replaces the token while the installer lives on).
+	// The token is only sent when the bundle URL has the backend's own
+	// origin. Nil: downloads are unauthenticated.
+	Credentials func() (backendURL, token string)
+	Keep        int
+	Logf        func(format string, args ...any)
 
 	HTTP     *http.Client
 	UVURL    string // default: the pinned GitHub release asset for GOARCH
@@ -184,7 +186,7 @@ func (i *Installer) install(ctx context.Context, b Bundle, dir string) (Runtime,
 	if err := os.MkdirAll(dir, 0o750); err != nil {
 		return Runtime{}, err
 	}
-	archive, err := i.fetch(ctx, b.URL, b.SHA256, maxBundleBytes, i.sameOrigin(b.URL))
+	archive, err := i.fetch(ctx, b.URL, b.SHA256, maxBundleBytes, i.bundleToken(b.URL))
 	if err != nil {
 		return Runtime{}, fmt.Errorf("sidecar bundle: %w", err)
 	}
@@ -280,7 +282,7 @@ func (i *Installer) ensureUV(ctx context.Context) (string, error) {
 		u = fmt.Sprintf("https://github.com/astral-sh/uv/releases/download/%s/uv-%s.tar.gz", uvVersion, triple)
 		sum = uvSHA256[runtime.GOARCH]
 	}
-	archive, err := i.fetch(ctx, u, sum, maxUVBytes, false)
+	archive, err := i.fetch(ctx, u, sum, maxUVBytes, "")
 	if err != nil {
 		return "", fmt.Errorf("uv: %w", err)
 	}
@@ -300,21 +302,31 @@ func (i *Installer) ensureUV(ctx context.Context) (string, error) {
 	return bin, nil
 }
 
-func (i *Installer) sameOrigin(raw string) bool {
+// bundleToken is the token to send with a download of raw: the current
+// one, and only to the backend's own origin ("" otherwise).
+func (i *Installer) bundleToken(raw string) string {
+	if i.Credentials == nil {
+		return ""
+	}
+	backend, token := i.Credentials()
 	a, err1 := url.Parse(raw)
-	b, err2 := url.Parse(i.BackendURL)
-	return err1 == nil && err2 == nil && i.Token != "" &&
-		strings.EqualFold(a.Scheme, b.Scheme) && strings.EqualFold(a.Host, b.Host)
+	b, err2 := url.Parse(backend)
+	if err1 != nil || err2 != nil || token == "" ||
+		!strings.EqualFold(a.Scheme, b.Scheme) || !strings.EqualFold(a.Host, b.Host) {
+		return ""
+	}
+	return token
 }
 
-// fetch downloads u (bounded) and checks its sha256.
-func (i *Installer) fetch(ctx context.Context, u, wantSHA string, limit int64, auth bool) ([]byte, error) {
+// fetch downloads u (bounded) and checks its sha256. A non-empty token is
+// sent as a bearer token.
+func (i *Installer) fetch(ctx context.Context, u, wantSHA string, limit int64, token string) ([]byte, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	if err != nil {
 		return nil, err
 	}
-	if auth {
-		req.Header.Set("Authorization", "Bearer "+i.Token)
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
 	}
 	c := i.HTTP
 	if c == nil {

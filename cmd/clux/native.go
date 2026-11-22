@@ -311,7 +311,7 @@ type nativeHost struct {
 
 // setupNative starts the egress proxy when native mode is installed for
 // this user. It returns nil (docker only) otherwise, logging why.
-func setupNative(ctx context.Context, cfg *config.Config, stateDir string) *nativeHost {
+func setupNative(ctx context.Context, creds *config.Credentials, stateDir string) *nativeHost {
 	if runtime.GOOS != "darwin" {
 		return nil
 	}
@@ -359,15 +359,21 @@ func setupNative(ctx context.Context, cfg *config.Config, stateDir string) *nati
 				}
 				return missingSlot(n)
 			},
-			Slots:  slots,
-			Keeper: &native.KeeperClient{Socket: native.KeeperSocket},
-			Installer: &sidecarrt.Installer{
-				Root: native.RuntimeRoot, BackendURL: cfg.BackendURL, Token: cfg.Token, Logf: log.Printf,
-			},
+			Slots:     slots,
+			Keeper:    &native.KeeperClient{Socket: native.KeeperSocket},
+			Installer: newSidecarInstaller(native.RuntimeRoot, creds),
 			Egress:    proxy,
 			ProxyPort: ncfg.ProxyPort,
 		},
 	}
+}
+
+// newSidecarInstaller installs native sidecar runtimes under root. Bundle
+// downloads authenticate with creds as they are at download time: a
+// re-login in `clux host start` must reach them (a copied token kept
+// sending the old one: 401 on every workspace.start after a re-login).
+func newSidecarInstaller(root string, creds *config.Credentials) *sidecarrt.Installer {
+	return &sidecarrt.Installer{Root: root, Credentials: creds.Get, Logf: log.Printf}
 }
 
 // missingSlot answers for a slot the install no longer has (pool shrunk

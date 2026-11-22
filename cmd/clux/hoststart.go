@@ -88,14 +88,18 @@ func runHostStart(args []string) error {
 	if err != nil {
 		return err
 	}
-	login := func(ctx context.Context) error {
+	// The one live copy of the backend URL + token: the tunnel and the
+	// native runtime installer read it on every use, and every login below
+	// updates it, so a re-login reaches all of them (none keeps a copy).
+	creds := config.NewCredentials(cfg)
+	login := updatingCredentials(cfg, creds, func(ctx context.Context) error {
 		backend := cfg.BackendURL
 		if backend == "" {
 			backend = defaultBackendURL
 		}
 		_, err := browserLogin(ctx, cfg, backend, os.Stdout)
 		return err
-	}
+	})
 	relogin := &reloginOnce{interactive: interactive, login: login, out: os.Stdout}
 	justLoggedIn := false
 	if !cfg.LoggedIn() {
@@ -200,7 +204,7 @@ func runHostStart(args []string) error {
 	// again (the service never prompts). A foreground run finds out on
 	// its first register instead.
 	if a := bg.decide(); interactive && !justLoggedIn && (a == bgInstall || a == bgPrompt) {
-		if err := relogin.do(ctx, verifyToken(cfg)); err != nil {
+		if err := relogin.do(ctx, verifyToken(creds)); err != nil {
 			if tunnel.IsFatal(err) {
 				logger.Printf("fatal: %v", err)
 				return &exitError{code: exitFatalConfig, err: err}
@@ -218,7 +222,7 @@ func runHostStart(args []string) error {
 		return nil
 	}
 
-	h := newHostLoop(cfg, *interval, logger)
+	h := newHostLoop(creds, *interval, logger)
 	h.caps = &native.Capabilities{Supervisor: func(ctx context.Context) (string, string, error) {
 		ncfg, err := native.LoadConfig()
 		if err != nil {
@@ -226,14 +230,15 @@ func runHostStart(args []string) error {
 		}
 		return supervisorsSummary(slotsStatus(ctx, ncfg))
 	}}
-	if nh := setupNative(ctx, cfg, stateDir); nh != nil {
+	if nh := setupNative(ctx, creds, stateDir); nh != nil {
 		h.proxy = nh.proxy
 		h.opts.Runtimes = map[string]hostsession.Runtime{hostsession.RuntimeNativeMacOS: nh.runtime}
 		h.opts.Egress = nh.proxy
 		h.caps.FreeSlots = nh.runtime.Slots.Free
 	}
 	go h.dispatch(ctx, netwatch.Watch(ctx, netwatch.Options{}))
-	// h.cfg is cfg: a re-login inside relogin.do hands h the new token.
+	// A re-login inside relogin.do updates creds: the next dial and every
+	// later bundle download use the new token.
 	err = relogin.do(ctx, func(ctx context.Context) error {
 		logger.Flush()
 		return h.run(ctx)
@@ -243,23 +248,37 @@ func runHostStart(args []string) error {
 		// whole point of the file.
 		return fatalExit(ctx, err, asService, logger.Printf, func(ctx context.Context) bool {
 			logger.Flush()
-			return waitForCredentials(ctx, cfg.Token, logger.Printf)
+			_, token := creds.Get()
+			return waitForCredentials(ctx, token, logger.Printf)
 		})
 	}
 	return err
+}
+
+// updatingCredentials wraps a login that stores new credentials in cfg so
+// that creds, the copy everything else reads, follows.
+func updatingCredentials(cfg *config.Config, creds *config.Credentials, login func(context.Context) error) func(context.Context) error {
+	return func(ctx context.Context) error {
+		if err := login(ctx); err != nil {
+			return err
+		}
+		creds.Set(cfg.BackendURL, cfg.Token)
+		return nil
+	}
 }
 
 // verifyToken registers once with the stored token and hangs up, so a
 // rejected token shows up while the user is still at the terminal. Only
 // fatal errors count; anything else (offline, backend down) is left to the
 // agent's own retries.
-func verifyToken(cfg *config.Config) func(context.Context) error {
+func verifyToken(creds *config.Credentials) func(context.Context) error {
 	return func(ctx context.Context) error {
 		info, err := collectInfo()
 		if err != nil {
 			return nil
 		}
-		sess, err := tunnel.Dial(ctx, cfg.BackendURL, cfg.Token, version, info, nil)
+		backend, token := creds.Get()
+		sess, err := tunnel.Dial(ctx, backend, token, version, info, nil)
 		if err != nil {
 			if tunnel.IsFatal(err) {
 				return err
@@ -272,7 +291,7 @@ func verifyToken(cfg *config.Config) func(context.Context) error {
 }
 
 type hostLoop struct {
-	cfg      *config.Config
+	creds    *config.Credentials // read on every dial, never copied
 	interval time.Duration
 	log      *logx.Logger
 	results  *hostsession.Results
@@ -294,9 +313,9 @@ type hostLoop struct {
 	attempts  int
 }
 
-func newHostLoop(cfg *config.Config, interval time.Duration, l *logx.Logger) *hostLoop {
+func newHostLoop(creds *config.Credentials, interval time.Duration, l *logx.Logger) *hostLoop {
 	return &hostLoop{
-		cfg:      cfg,
+		creds:    creds,
 		interval: interval,
 		log:      l,
 		results:  hostsession.NewResults(),
@@ -452,7 +471,8 @@ func (h *hostLoop) session(ctx context.Context) (lived time.Duration, immediate 
 	}
 
 	caps := h.caps.Collect(ctx)
-	sess, err := tunnel.Dial(ctx, h.cfg.BackendURL, h.cfg.Token, version, info, caps)
+	backend, token := h.creds.Get()
+	sess, err := tunnel.Dial(ctx, backend, token, version, info, caps)
 	if err != nil {
 		return 0, false, err
 	}

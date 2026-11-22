@@ -5,9 +5,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 
+	"github.com/eduardkumskyi/clux-cli/internal/config"
+	"github.com/eduardkumskyi/clux-cli/internal/sidecarrt"
 	"github.com/eduardkumskyi/clux-cli/internal/tunnel"
 )
 
@@ -84,6 +89,57 @@ func TestReloginNonInteractiveNeverPrompts(t *testing.T) {
 	}
 	if out.Len() != 0 {
 		t.Fatalf("printed %q", out.String())
+	}
+}
+
+// The production bug: the installer was built with a copy of the token
+// before the re-login, so every bundle download after it still sent the
+// old one (401). Now the re-login updates the live credentials, and the
+// installer's next download carries the new token.
+func TestReloginReachesSidecarInstaller(t *testing.T) {
+	var mu sync.Mutex
+	var auths []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		auths = append(auths, r.Header.Get("Authorization"))
+		mu.Unlock()
+		if r.Header.Get("Authorization") != "Bearer new-pat" {
+			http.Error(w, "nope", http.StatusUnauthorized)
+			return
+		}
+		w.Write([]byte("not a bundle")) // fails the sha256 check: the auth is what matters
+	}))
+	defer srv.Close()
+
+	cfg := &config.Config{BackendURL: srv.URL, Token: "old-pat"}
+	creds := config.NewCredentials(cfg)
+	inst := newSidecarInstaller(t.TempDir(), creds)
+	inst.Logf = t.Logf
+	bundle := sidecarrt.Bundle{Version: "sha-47e349bdb93c5c8d", SHA256: strings.Repeat("0", 64), URL: srv.URL + "/api/compute-hosts/sidecar-bundle/x.tar.gz"}
+
+	r := &reloginOnce{interactive: true, out: &bytes.Buffer{}, login: updatingCredentials(cfg, creds, func(context.Context) error {
+		cfg.Token = "new-pat" // what browserLogin stores
+		return nil
+	})}
+	first := true
+	err := r.do(context.Background(), func(ctx context.Context) error {
+		if first { // the tunnel finds the old token rejected
+			first = false
+			return rejected
+		}
+		_, err := inst.Ensure(ctx, bundle, nil)
+		return err
+	})
+	if err == nil || strings.Contains(err.Error(), "401") || !strings.Contains(err.Error(), "sha256 mismatch") {
+		t.Fatalf("download after the re-login: %v", err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(auths) != 1 || auths[0] != "Bearer new-pat" {
+		t.Fatalf("bundle download sent %q, want the new token", auths)
+	}
+	if b, tok := creds.Get(); b != srv.URL || tok != "new-pat" {
+		t.Fatalf("live credentials %q %q", b, tok)
 	}
 }
 
