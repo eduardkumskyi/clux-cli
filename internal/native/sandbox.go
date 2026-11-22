@@ -51,6 +51,19 @@ func (p ProfileParams) validate() error {
 // narrower than localhost:*; pf decides which loopback ports are the
 // agent's. mDNSResponder is not reachable, so sandboxed tools can't use
 // DNS as a side channel (the proxy resolves names).
+// subpaths is a "(subpath ...)" line for dir, plus the same dir spelled
+// through the /var symlink when it lives under /private/var. The kernel
+// matches resolved paths, but services that check a client's sandbox by
+// path string (cfprefsd: "Path not accessible" for
+// /var/clux/slots/<n>/Library/Preferences/...) use the /var spelling.
+func subpaths(dir string) string {
+	line := fmt.Sprintf("  (subpath %s)\n", sbString(dir))
+	if rest, ok := strings.CutPrefix(dir, "/private/var/"); ok {
+		line += fmt.Sprintf("  (subpath %s)\n", sbString("/var/"+rest))
+	}
+	return line
+}
+
 func SandboxProfile(p ProfileParams) (string, error) {
 	if err := p.validate(); err != nil {
 		return "", err
@@ -90,7 +103,7 @@ func SandboxProfile(p ProfileParams) (string, error) {
   (literal "/private/var/db/xcode_select_link")
   (subpath "/private/var/select")
 `)
-	fmt.Fprintf(&b, "  (subpath %s)\n", q(p.RuntimeDir))
+	b.WriteString(subpaths(p.RuntimeDir))
 	if app := xcodeApp(p.DeveloperDir); app != "" {
 		fmt.Fprintf(&b, "  (subpath %s)\n", q(app))
 	} else {
@@ -103,8 +116,8 @@ func SandboxProfile(p ProfileParams) (string, error) {
 ;; read+write: the workspace (incl. its HOME and TMPDIR) and the agent's Library
 (allow file-read* file-write*
 `)
-	fmt.Fprintf(&b, "  (subpath %s)\n", q(p.WorkspaceDir))
-	fmt.Fprintf(&b, "  (subpath %s)\n", q(lib))
+	b.WriteString(subpaths(p.WorkspaceDir))
+	b.WriteString(subpaths(lib))
 	// Dot entries of the account's real home (~/.config/flutter, ~/.pub-cache,
 	// ...): Xcode runs build-phase scripts with HOME from the account, not
 	// the workspace's. The slot home is this slot's alone and wiped on
@@ -121,8 +134,8 @@ func SandboxProfile(p ProfileParams) (string, error) {
 ;; keeper wipes them when the slot changes hands, so they're opened whole.
 (allow file-read* file-write*
 `)
-	fmt.Fprintf(&b, "  (subpath %s)\n", q(p.UserCache))
-	fmt.Fprintf(&b, "  (subpath %s)\n", q(p.UserTemp))
+	b.WriteString(subpaths(p.UserCache))
+	b.WriteString(subpaths(p.UserTemp))
 	// Also by shape, not only by the dirs resolved at supervisor start: a
 	// LaunchDaemon's getconf can miss them (then the explicit rules above
 	// name /private/var/empty and every write here failed). Every per-user
