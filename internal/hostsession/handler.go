@@ -2,6 +2,7 @@
 // it dispatches workspace.start/stop/delete command frames to the runtime
 // named in their "runtime" field (docker via the dockerhost package, or the
 // native macOS runtime), egress.policy/decision frames to the egress proxy,
+// host_exec.run frames to the host-command executor (internal/hostexec),
 // and dial.open/data/close frames to the dialproxy package, replying over
 // the same Session the frames arrived on.
 package hostsession
@@ -15,6 +16,7 @@ import (
 
 	"github.com/eduardkumskyi/clux-cli/internal/dialproxy"
 	"github.com/eduardkumskyi/clux-cli/internal/egress"
+	"github.com/eduardkumskyi/clux-cli/internal/hostexec"
 	"github.com/eduardkumskyi/clux-cli/internal/redact"
 	"github.com/eduardkumskyi/clux-cli/internal/tunnel"
 )
@@ -42,6 +44,8 @@ type Options struct {
 	Runtimes map[string]Runtime
 	// Egress is the native runtime's egress proxy (nil without native mode).
 	Egress *egress.Proxy
+	// HostExec runs owner-approved host_exec.run commands (nil: refused).
+	HostExec *hostexec.Executor
 }
 
 // New builds a handler for one tunnel session. cmdCtx is the process-level
@@ -152,6 +156,14 @@ func (h *Handler) dispatch(ctx context.Context, frameType string, frame map[stri
 		}
 		h.opts.Egress.Decide(id, stringField(frame, "request_id"), decision, stringField(frame, "host"))
 		return nil, nil
+
+	case "host_exec.run":
+		// Accepted (or refused) at once; the outcome follows later as an
+		// unsolicited host_exec.result frame (internal/hostexec).
+		if h.opts.HostExec == nil {
+			return nil, errors.New("host commands are not available on this host")
+		}
+		return nil, h.opts.HostExec.Start(frame)
 
 	default:
 		return nil, fmt.Errorf("unknown command type %q", frameType)

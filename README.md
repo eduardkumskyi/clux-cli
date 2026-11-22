@@ -244,6 +244,29 @@ made root-only (no leftover uid owns reachable files). macOS only lets a
 process with Full Disk Access delete account records; without it
 everything else is removed and the remaining `dscl` commands are printed.
 
+## Host commands
+
+Sometimes the agent in a workspace needs something its sandbox or container
+can't do, such as `brew install android-commandlinetools`. It can ask for a
+host command: you see the exact command, its folder and the agent's reason in
+the chat, and choose Allow, Deny or "I'll do it myself". Nothing runs without
+an answer (or a rule you set per computer in the clux settings), and a
+request with no answer is denied.
+
+On Allow, `clux host start` runs the command on this computer:
+
+- as you (the user running `clux host start`, never root), in your login
+  shell (`$SHELL -lc`), from your home folder unless a folder was given;
+- with stdin on `/dev/null`, so nothing can prompt. Commands that need a
+  password (`sudo`, `su`, `doas`, `pkexec`) are refused: run those yourself;
+- for at most 15 minutes (the backend may set up to 1 hour); on timeout the
+  command and everything it started are stopped;
+- keeping the last 64 KiB of its output, which goes back to the agent with
+  the exit code.
+
+Every host command is logged to `host.log` (command with secrets redacted,
+exit code, duration; never its output). At most 4 run at once.
+
 ## Connection resilience
 
 `clux host start` is built for laptops on unreliable networks:
