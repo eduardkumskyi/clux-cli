@@ -204,7 +204,7 @@ func runHostStart(args []string) error {
 	// again (the service never prompts). A foreground run finds out on
 	// its first register instead.
 	if a := bg.decide(); interactive && !justLoggedIn && (a == bgInstall || a == bgPrompt) {
-		if err := relogin.do(ctx, verifyToken(creds)); err != nil {
+		if err := relogin.do(ctx, verifyToken(creds, os.Stdout)); err != nil {
 			if tunnel.IsFatal(err) {
 				logger.Printf("fatal: %v", err)
 				return &exitError{code: exitFatalConfig, err: err}
@@ -216,6 +216,9 @@ func runHostStart(args []string) error {
 	// macOS: offer the native runtime once (interactive only), or warn if
 	// it is installed but unhealthy. Never blocks docker-only mode.
 	newNativeOffer(cfg, *noNativePrompt, log.Printf).run()
+	if notice := nativeBehindNotice(version); notice != "" {
+		logger.Printf("%s", notice)
+	}
 
 	if bg.run() {
 		logger.Printf("handed over to the background service")
@@ -270,8 +273,8 @@ func updatingCredentials(cfg *config.Config, creds *config.Credentials, login fu
 // verifyToken registers once with the stored token and hangs up, so a
 // rejected token shows up while the user is still at the terminal. Only
 // fatal errors count; anything else (offline, backend down) is left to the
-// agent's own retries.
-func verifyToken(creds *config.Credentials) func(context.Context) error {
+// agent's own retries. A newer clux is mentioned on out.
+func verifyToken(creds *config.Credentials, out io.Writer) func(context.Context) error {
 	return func(ctx context.Context) error {
 		info, err := collectInfo()
 		if err != nil {
@@ -284,6 +287,9 @@ func verifyToken(creds *config.Credentials) func(context.Context) error {
 				return err
 			}
 			return nil
+		}
+		if notice := updateNotice(version, sess.LatestVersion); notice != "" {
+			fmt.Fprintln(out, notice)
 		}
 		_ = sess.Close()
 		return nil
@@ -311,6 +317,9 @@ type hostLoop struct {
 	bo        backoff.Policy
 	downSince time.Time // zero while connected
 	attempts  int
+	// updateNoticed: the "newer clux available" line was logged (once per
+	// process, not at every reconnect).
+	updateNoticed bool
 }
 
 func newHostLoop(creds *config.Credentials, interval time.Duration, l *logx.Logger) *hostLoop {
@@ -485,6 +494,10 @@ func (h *hostLoop) session(ctx context.Context) (lived time.Duration, immediate 
 		h.log.Printf("reconnected as host %q after %s (%d attempt(s))",
 			sess.Name, time.Since(h.downSince).Round(time.Second), h.attempts)
 		h.downSince = time.Time{}
+	}
+	if notice := updateNotice(version, sess.LatestVersion); notice != "" && !h.updateNoticed {
+		h.updateNoticed = true
+		h.log.Printf("%s", notice)
 	}
 
 	sessionCtx, cancel := context.WithCancel(ctx)

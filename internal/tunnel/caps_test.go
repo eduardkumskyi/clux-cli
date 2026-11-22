@@ -44,8 +44,53 @@ func TestRegisterCarriesCapabilities(t *testing.T) {
 	defer sess2.Close()
 	fb2.mu.Lock()
 	defer fb2.mu.Unlock()
-	if _, ok := fb2.reg["capabilities"]; ok {
-		t.Fatal("nil capabilities must be omitted")
+	// No runtimes (docker only, as before), but the feature flags always
+	// ride along: a refused register still tells the backend what this CLI
+	// can do (e.g. `clux update`).
+	c2, _ := fb2.reg["capabilities"].(map[string]any)
+	if _, ok := c2["runtimes"]; ok || len(c2) != 1 {
+		t.Fatalf("nil capabilities must carry only features: %v", fb2.reg)
+	}
+	if f, _ := c2["features"].([]any); len(f) == 0 || f[0] != "self_update" {
+		t.Fatalf("features missing: %v", fb2.reg)
+	}
+	if f, _ := c["features"].([]any); len(f) == 0 {
+		t.Fatalf("features missing next to runtimes: %v", reg)
+	}
+	if _, ok := caps["features"]; ok {
+		t.Fatal("the caller's map must not be changed")
+	}
+}
+
+func TestHeartbeatCapabilitiesCarryFeatures(t *testing.T) {
+	hb := heartbeatFrame(sysinfo.Info{}, "1", map[string]any{"runtimes": []string{"docker"}})
+	c, _ := hb["capabilities"].(map[string]any)
+	if f, _ := c["features"].([]string); len(f) == 0 {
+		t.Fatalf("heartbeat capabilities replace the stored ones, so they need features too: %v", hb)
+	}
+	if _, ok := heartbeatFrame(sysinfo.Info{}, "1", nil)["capabilities"]; ok {
+		t.Fatal("unchanged capabilities stay out of heartbeats")
+	}
+}
+
+func TestRegisterAckCarriesLatestVersion(t *testing.T) {
+	fb := newFakeBackend(t, "latest")
+	sess, err := Dial(context.Background(), fb.srv.URL, "tok", "0.5.2", sysinfo.Info{}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sess.Close()
+	if sess.LatestVersion != "0.6.0" {
+		t.Fatalf("LatestVersion = %q", sess.LatestVersion)
+	}
+	old := newFakeBackend(t, "alive")
+	sess2, err := Dial(context.Background(), old.srv.URL, "tok", "0.5.2", sysinfo.Info{}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sess2.Close()
+	if sess2.LatestVersion != "" {
+		t.Fatalf("an older backend says nothing: %q", sess2.LatestVersion)
 	}
 }
 

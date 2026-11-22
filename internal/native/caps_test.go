@@ -89,7 +89,7 @@ func TestCapabilities(t *testing.T) {
 	c := &Capabilities{
 		Supervisor: func(context.Context) (string, string, error) { return "0.4.0", "active", nil },
 		loadConfig: func() (*Config, error) {
-			return &Config{Slots: []Slot{{N: 1, User: "_clux1"}, {N: 2, User: "_clux2"}, {N: 3, User: "_clux3"}}}, nil
+			return &Config{CLIVersion: "v0.5.2", Slots: []Slot{{N: 1, User: "_clux1"}, {N: 2, User: "_clux2"}, {N: 3, User: "_clux3"}}}, nil
 		},
 		FreeSlots: func() int { return 1 },
 		pfStatus: func() (PFStatus, error) {
@@ -104,7 +104,7 @@ func TestCapabilities(t *testing.T) {
 		"native_macos": map[string]any{
 			"installed": true, "agent_user": "_clux1.._clux3", "xcode_version": "16.4",
 			"simulator_runtimes": []string{"iOS 18.6"}, "sandbox": "active", "pf": "active",
-			"supervisor_version": "0.4.0", "slots_total": 3, "slots_free": 1,
+			"supervisor_version": "0.4.0", "daemon_version": "v0.5.2", "slots_total": 3, "slots_free": 1,
 		},
 	}
 	if !reflect.DeepEqual(got, want) {
