@@ -2,6 +2,7 @@ package hostsession
 
 import (
 	"context"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -19,6 +20,9 @@ func TestHostExecRunWithoutExecutorIsRefused(t *testing.T) {
 }
 
 func TestHostExecRunRefusalIsTheResult(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("host commands are not supported on Windows")
+	}
 	r := NewResults()
 	h := New(context.Background(), nil, r, Options{HostExec: hostexec.New(func(map[string]any) {})})
 	h.HandleCommand(context.Background(), "host_exec.run", decode(t,
