@@ -52,6 +52,18 @@ fi
 
 ASSET="clux_${OS}_${ARCH}.tar.gz"
 URL="$BASE/$ASSET"
+# Published by the release workflow (goreleaser) next to the archives:
+# "<sha256>  <file>" per line.
+SUMS_URL="$BASE/checksums.txt"
+
+# SHA-256 of a file, with whichever tool this OS ships.
+if command -v sha256sum >/dev/null 2>&1; then
+  sha256() { sha256sum "$1" | awk '{print $1}'; }
+elif command -v shasum >/dev/null 2>&1; then
+  sha256() { shasum -a 256 "$1" | awk '{print $1}'; }
+else
+  err "need sha256sum or shasum to verify the download"
+fi
 
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
@@ -60,6 +72,24 @@ echo "clux-install: downloading $ASSET ($VERSION)..."
 if ! $DL "$URL" > "$tmp/$ASSET"; then
   err "download failed: $URL"
 fi
+if ! $DL "$SUMS_URL" > "$tmp/checksums.txt"; then
+  err "download failed: $SUMS_URL (refusing to install an unverified binary)"
+fi
+
+# Verify before anything touches the archive. Fail closed: no matching line,
+# or a different hash, stops the install.
+expected=$(awk -v f="$ASSET" '$2 == f || $2 == "*" f { print $1; exit }' "$tmp/checksums.txt")
+[ -n "$expected" ] || err "no checksum for $ASSET in $SUMS_URL (refusing to install an unverified binary)"
+case "$expected" in
+  *[!0-9a-f]*) err "malformed checksum for $ASSET in $SUMS_URL" ;;
+esac
+[ "${#expected}" -eq 64 ] || err "malformed checksum for $ASSET in $SUMS_URL"
+actual=$(sha256 "$tmp/$ASSET")
+if [ "$actual" != "$expected" ]; then
+  err "checksum mismatch for $ASSET (expected $expected, got $actual); not installing"
+fi
+echo "clux-install: checksum verified"
+
 # A 404 from GitHub is served as a tiny HTML body, not a gzip stream.
 if ! tar -tzf "$tmp/$ASSET" >/dev/null 2>&1; then
   err "no release asset for $OS/$ARCH at $URL (has a release been published?)"
