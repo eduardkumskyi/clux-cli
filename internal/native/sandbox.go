@@ -110,17 +110,14 @@ func SandboxProfile(p ProfileParams) (string, error) {
 (allow file-ioctl
   (literal "/dev/dtracehelper") (literal "/dev/tty") (literal "/dev/ptmx") (regex #"^/dev/ttys[0-9]+$"))
 
-;; Xcode tools use the per-user confstr() dirs for a few things; open only
-;; their own entries (com.apple.bsd.dirhelper stays denied, so everything
-;; else falls back to $TMPDIR inside the workspace).
+;; The agent's per-user confstr() temp and cache dirs. Xcode and SwiftPM
+;; write there regardless of $TMPDIR (e.g. "unable to make temporary file"
+;; when resolving packages). Both belong to the slot's uid alone and the
+;; keeper wipes them when the slot changes hands, so they're opened whole.
 (allow file-read* file-write*
 `)
-	fmt.Fprintf(&b, "  (subpath %s)\n", q(p.UserCache+"/com.apple.DeveloperTools"))
-	fmt.Fprintf(&b, "  (subpath %s)\n", q(p.UserCache+"/com.apple.CoreSimulator.simctl"))
-	ut := regexp.QuoteMeta(p.UserTemp)
-	fmt.Fprintf(&b, "  (regex #\"^%s/xcrun_db\")\n", ut)
-	fmt.Fprintf(&b, "  (regex #\"^%s/swbuild\\.tmp\\.\")\n", ut)
-	fmt.Fprintf(&b, "  (regex #\"^%s/TemporaryItems/NSIRD_(xcodebuild|SWBBuildService)_\"))\n", ut)
+	fmt.Fprintf(&b, "  (subpath %s)\n", q(p.UserCache))
+	fmt.Fprintf(&b, "  (subpath %s))\n", q(p.UserTemp))
 
 	b.WriteString(`
 ;; mach services: logging, directory lookups, prefs, TLS trust, and the

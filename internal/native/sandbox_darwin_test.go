@@ -34,7 +34,14 @@ func TestSandboxProfileEnforced(t *testing.T) {
 	if _, err := os.Stat("/usr/bin/sandbox-exec"); err != nil {
 		t.Skip("no sandbox-exec")
 	}
-	root := resolved(t, t.TempDir())
+	// Not t.TempDir(): that lives in this user's confstr temp dir, which the
+	// profile opens whole (it's the agent's own; workspaces never live there).
+	tmp, err := os.MkdirTemp("/private/tmp", "clux-sb-test-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(tmp) })
+	root := resolved(t, tmp)
 	ws := filepath.Join(root, "workspaces", "12")
 	other := filepath.Join(root, "workspaces", "13")
 	home := filepath.Join(root, "home")
@@ -71,6 +78,13 @@ func TestSandboxProfileEnforced(t *testing.T) {
 	}
 	if err := run("/usr/bin/touch", filepath.Join(ws, "new")); err != nil {
 		t.Fatalf("workspace not writable: %v", err)
+	}
+	// SwiftPM/Xcode temp files in the confstr temp dir ("unable to make
+	// temporary file" otherwise).
+	probe := filepath.Join(getconf(t, "DARWIN_USER_TEMP_DIR"), filepath.Base(root)+".probe")
+	t.Cleanup(func() { os.Remove(probe) })
+	if err := run("/usr/bin/touch", probe); err != nil {
+		t.Fatalf("confstr temp dir not writable: %v", err)
 	}
 	if run("/bin/cat", filepath.Join(other, "secret")) == nil {
 		t.Fatal("another workspace's file was readable")

@@ -173,14 +173,18 @@ func (k *KeeperClient) call(ctx context.Context, req KeeperRequest) (KeeperRespo
 		}
 	}
 	b, _ := json.Marshal(req)
-	if _, err := conn.Write(append(b, '\n')); err != nil {
-		return KeeperResponse{}, fmt.Errorf("slot keeper: %w", err)
-	}
+	// The keeper may refuse (wrong uid) and close before reading the
+	// request; its one-line reply is still in the socket, so a failed
+	// write falls through to the read and reports that reply instead.
+	_, werr := conn.Write(append(b, '\n'))
 	var resp KeeperResponse
 	line, err := bufio.NewReaderSize(conn, 4096).ReadSlice('\n')
 	if err != nil {
 		if ctx.Err() != nil {
 			return resp, ctx.Err()
+		}
+		if werr != nil {
+			err = werr
 		}
 		return resp, fmt.Errorf("slot keeper: %w", err)
 	}

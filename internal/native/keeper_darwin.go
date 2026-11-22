@@ -18,6 +18,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -44,18 +45,22 @@ type keeper struct {
 	prepare            func(s Slot) error
 
 	slots map[int]*sync.Mutex // held while a slot's state changes (wipe: minutes)
+	// wiping is read by State without the slot lock: a state query taking
+	// the lock, however briefly, made a concurrent wipe fail as "busy".
+	wiping map[int]*atomic.Bool
 
 	// updater serves KeeperOpUpdate / KeeperOpVersion (nil: not offered).
 	updater *daemonUpdater
 }
 
 func newKeeper(cfg *Config, logf func(string, ...any)) (*keeper, error) {
-	k := &keeper{cfg: cfg, logf: logf, stateDir: StateDir, slots: map[int]*sync.Mutex{}}
+	k := &keeper{cfg: cfg, logf: logf, stateDir: StateDir, slots: map[int]*sync.Mutex{}, wiping: map[int]*atomic.Bool{}}
 	k.wipe = k.wipeSlot
 	k.resident = slotResident
 	k.prepare = prepareSlot
 	for _, s := range cfg.Slots {
 		k.slots[s.N] = &sync.Mutex{}
+		k.wiping[s.N] = &atomic.Bool{}
 	}
 	return k, nil
 }
@@ -134,16 +139,13 @@ func (k *keeper) dispatch(ctx context.Context, req KeeperRequest) KeeperResponse
 	}
 	switch req.Op {
 	case KeeperOpState:
-		if !mu.TryLock() {
-			st, _ := k.load(s.N)
-			st.Busy = true
-			return KeeperResponse{OK: true, State: &st}
-		}
-		defer mu.Unlock()
+		// No slot lock: the record is replaced atomically, and taking the
+		// lock here made a wipe arriving at the same moment fail as busy.
 		st, err := k.load(s.N)
 		if err != nil {
 			return KeeperResponse{Error: err.Error()}
 		}
+		st.Busy = k.wiping[s.N].Load()
 		return KeeperResponse{OK: true, State: &st}
 	case KeeperOpClaim:
 		if !mu.TryLock() {
@@ -180,6 +182,8 @@ func (k *keeper) dispatch(ctx context.Context, req KeeperRequest) KeeperResponse
 			return KeeperResponse{Error: fmt.Sprintf("slot %d is busy (being wiped)", s.N)}
 		}
 		defer mu.Unlock()
+		k.wiping[s.N].Store(true)
+		defer k.wiping[s.N].Store(false)
 		st, err := k.load(s.N)
 		if err != nil {
 			return KeeperResponse{Error: err.Error()}
