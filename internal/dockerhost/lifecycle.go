@@ -19,12 +19,18 @@ package dockerhost
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
+	"log"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/eduardkumskyi/clux-cli/internal/redact"
 )
 
 // containerLocks serializes Start/Stop/Delete per container name. Lifecycle
@@ -161,13 +167,22 @@ func Start(ctx context.Context, req StartRequest) (StartResult, error) {
 	}
 	args = append(args, req.Image)
 
+	// Pull first, on our terms: `docker run`'s own implicit pull fails on a
+	// stale saved login (see ensureImage), with no way to retry.
+	if err := ensureImage(ctx, req.Image); err != nil {
+		return StartResult{}, err
+	}
+
 	out, err := runDocker(ctx, args...)
 	// `docker run -d` prints the new container's ID; cleanup targets that
 	// exact container, never just the name (see containerLocks).
 	containerID := strings.TrimSpace(out)
 	if err != nil {
 		cleanupFailedStart(containerID, req.ContainerName)
-		return StartResult{}, fmt.Errorf("docker run failed: %w", err)
+		// The full command helps diagnosis; it carries the sidecar secret
+		// and maybe a clone token, so only ever log it redacted.
+		log.Printf("docker %s", strings.Join(redact.Args(args), " "))
+		return StartResult{}, fmt.Errorf("docker run failed: %s", dockerMessage(err))
 	}
 
 	if err := waitRunning(ctx, req.ContainerName); err != nil {
@@ -237,7 +252,7 @@ func Delete(ctx context.Context, containerName, volumeName string) (DeleteResult
 
 	if _, err := runDocker(ctx, "volume", "rm", volumeName); err != nil {
 		if !isMissingVolume(err) {
-			return DeleteResult{}, fmt.Errorf("docker volume rm failed: %w", err)
+			return DeleteResult{}, fmt.Errorf("docker volume rm failed: %s", dockerMessage(err))
 		}
 	}
 
@@ -251,10 +266,10 @@ func stopAndRemove(ctx context.Context, containerName string) error {
 		return nil
 	}
 	if _, err := runDocker(ctx, "stop", containerName); err != nil && !isMissingContainer(err) {
-		return fmt.Errorf("docker stop failed: %w", err)
+		return fmt.Errorf("docker stop failed: %s", dockerMessage(err))
 	}
 	if _, err := runDocker(ctx, "rm", "-f", containerName); err != nil && !isMissingContainer(err) {
-		return fmt.Errorf("docker rm failed: %w", err)
+		return fmt.Errorf("docker rm failed: %s", dockerMessage(err))
 	}
 	return nil
 }
@@ -312,7 +327,7 @@ func waitRunning(ctx context.Context, containerName string) error {
 func publishedPort(ctx context.Context, containerName string, containerPort int) (int, error) {
 	out, err := runDocker(ctx, "port", containerName, fmt.Sprintf("%d/tcp", containerPort))
 	if err != nil {
-		return 0, fmt.Errorf("docker port failed: %w", err)
+		return 0, fmt.Errorf("docker port failed: %s", dockerMessage(err))
 	}
 	// Output looks like "127.0.0.1:34567" (possibly multiple lines if
 	// published on more than one address); take the first line's port.
@@ -372,11 +387,139 @@ func formatFloat(f float64) string {
 	return strconv.FormatFloat(f, 'f', -1, 64)
 }
 
-// runDocker is a variable so tests can substitute a fake docker.
-var runDocker = runDockerExec
+// publicECR is the registry the sidecar image is published to.
+const publicECR = "public.ecr.aws"
 
-func runDockerExec(ctx context.Context, args ...string) (string, error) {
+// ensureImage makes sure image is present locally, pulling it if not (the
+// same "missing" policy as `docker run`'s implicit pull, so a cached image
+// starts offline too).
+//
+// A saved but expired login for public.ecr.aws in the user's
+// ~/.docker/config.json (or credential store) makes every pull from it
+// fail, even of a public image: the registry refuses expired credentials
+// instead of ignoring them. For public.ecr.aws images such a pull is
+// retried anonymously, with a temporary empty Docker config, which leaves
+// the user's own config untouched.
+func ensureImage(ctx context.Context, image string) error {
+	if image == "" {
+		return nil // `docker run` reports it
+	}
+	if _, err := runDocker(ctx, "image", "inspect", "--format", "{{.Id}}", image); err == nil {
+		return nil
+	}
+	_, err := runDocker(ctx, "pull", "--quiet", image)
+	if err == nil {
+		return nil
+	}
+	msg := dockerMessage(err)
+	if !isRegistryAuthError(msg) {
+		return fmt.Errorf("pulling image %s failed: %s", image, msg)
+	}
+	reg := registryOf(image)
+	if reg != publicECR {
+		return fmt.Errorf("pulling image %s failed: the registry refused your saved Docker login for %s "+
+			"(run `docker login %s` again, or `docker logout %s`): %s", image, reg, reg, reg, msg)
+	}
+	if _, aerr := runDockerAnonymous(ctx, "pull", "--quiet", image); aerr != nil {
+		return fmt.Errorf("pulling image %s failed: your saved Docker login for %s was refused (%s), "+
+			"and pulling anonymously failed too: %s", image, publicECR, msg, dockerMessage(aerr))
+	}
+	log.Printf("your saved Docker login for %s has expired; pulled %s anonymously "+
+		"(`docker logout %s` removes the stale login)", publicECR, image, publicECR)
+	return nil
+}
+
+// isRegistryAuthError: the registry refused the credentials docker sent.
+func isRegistryAuthError(msg string) bool {
+	m := strings.ToLower(msg)
+	return containsAny(m,
+		"authorization token has expired", "token has expired", "reauthenticate",
+		"pull access denied", "unauthorized", "authentication required",
+		"denied: ", "403 forbidden", "no basic auth credentials", "error getting credentials")
+}
+
+// registryOf is the registry host of an image reference ("docker.io" for
+// Docker Hub's short names).
+func registryOf(image string) string {
+	first, _, ok := strings.Cut(image, "/")
+	if !ok || !(strings.ContainsAny(first, ".:") || first == "localhost") {
+		return "docker.io"
+	}
+	return strings.ToLower(first)
+}
+
+// dockerError is a failed docker command: which one, and what it said.
+// The arguments are deliberately not in the message (they can hold
+// secrets, and make it unreadable); callers that want the command line log
+// it themselves via redact.Args.
+type dockerError struct {
+	verb string
+	msg  string
+}
+
+func (e *dockerError) Error() string { return "docker " + e.verb + ": " + e.msg }
+
+// dockerMessage is what docker itself said, without the "docker <verb>:"
+// prefix.
+func dockerMessage(err error) string {
+	var de *dockerError
+	if errors.As(err, &de) {
+		return de.msg
+	}
+	return err.Error()
+}
+
+// dockerVerb names a command for messages: "run", "network create", ...
+func dockerVerb(args []string) string {
+	if len(args) == 0 {
+		return ""
+	}
+	switch args[0] {
+	case "network", "volume", "image", "container", "context":
+		if len(args) > 1 {
+			return args[0] + " " + args[1]
+		}
+	}
+	return args[0]
+}
+
+// runDocker and runDockerAnonymous are variables so tests can substitute a
+// fake docker.
+var (
+	runDocker          = func(ctx context.Context, args ...string) (string, error) { return runDockerExec(ctx, nil, args...) }
+	runDockerAnonymous = runDockerWithoutLogin
+)
+
+// runDockerWithoutLogin runs docker with a temporary, empty Docker config:
+// no saved logins and no credential helpers. The daemon endpoint is
+// carried over (DOCKER_HOST), since the active context (Docker Desktop,
+// colima, ...) lives in the config being skipped.
+func runDockerWithoutLogin(ctx context.Context, args ...string) (string, error) {
+	var env []string
+	if os.Getenv("DOCKER_HOST") == "" {
+		if out, err := runDockerExec(ctx, nil, "context", "inspect", "--format", "{{.Endpoints.docker.Host}}"); err == nil {
+			if host := strings.TrimSpace(out); host != "" {
+				env = append(env, "DOCKER_HOST="+host)
+			}
+		}
+	}
+	dir, err := os.MkdirTemp("", "clux-docker-anon-")
+	if err != nil {
+		return "", err
+	}
+	defer os.RemoveAll(dir)
+	if err := os.WriteFile(filepath.Join(dir, "config.json"), []byte("{}\n"), 0o600); err != nil {
+		return "", err
+	}
+	return runDockerExec(ctx, append(env, "DOCKER_CONFIG="+dir), args...)
+}
+
+// runDockerExec runs docker with the process environment plus env.
+func runDockerExec(ctx context.Context, env []string, args ...string) (string, error) {
 	cmd := exec.CommandContext(ctx, "docker", args...)
+	if len(env) > 0 {
+		cmd.Env = append(os.Environ(), env...)
+	}
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
@@ -388,7 +531,7 @@ func runDockerExec(ctx context.Context, args ...string) (string, error) {
 		if msg == "" {
 			msg = err.Error()
 		}
-		return stdout.String(), fmt.Errorf("docker %s: %s", strings.Join(args, " "), msg)
+		return stdout.String(), &dockerError{verb: dockerVerb(args), msg: redact.String(msg)}
 	}
 	return stdout.String(), nil
 }
