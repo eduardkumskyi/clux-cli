@@ -44,6 +44,9 @@ type keeper struct {
 	prepare            func(s Slot) error
 
 	slots map[int]*sync.Mutex // held while a slot's state changes (wipe: minutes)
+
+	// updater serves KeeperOpUpdate / KeeperOpVersion (nil: not offered).
+	updater *daemonUpdater
 }
 
 func newKeeper(cfg *Config, logf func(string, ...any)) (*keeper, error) {
@@ -111,6 +114,16 @@ func (k *keeper) handle(ctx context.Context, c *net.UnixConn) {
 }
 
 func (k *keeper) dispatch(ctx context.Context, req KeeperRequest) KeeperResponse {
+	switch req.Op { // machine-wide ops: no slot
+	case KeeperOpUpdate, KeeperOpVersion:
+		if k.updater == nil {
+			return KeeperResponse{Error: "this native daemon can't update itself"}
+		}
+		if req.Op == KeeperOpVersion {
+			return KeeperResponse{OK: true, Version: k.updater.version}
+		}
+		return k.updater.update(ctx, req)
+	}
 	s, ok := k.cfg.Slot(req.Slot)
 	mu := k.slots[req.Slot]
 	if !ok || mu == nil {

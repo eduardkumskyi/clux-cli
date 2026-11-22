@@ -31,7 +31,12 @@ const verifyEvery = 3
 // repairs it, publishing what it found. On SIGTERM it reloads the base
 // rules (no listener passes): with the daemon gone nothing would remove a
 // stale pass, so it fails closed.
-func RunPFD(ctx context.Context, logf func(string, ...any)) error {
+//
+// The daemon also applies self-updates (daemonupdate_darwin.go): after one,
+// it restarts idle supervisors onto the new binary and, once none runs a
+// workspace, exits the same way so launchd starts it from the new binary.
+func RunPFD(ctx context.Context, opts PFDOptions) error {
+	logf := opts.Logf
 	if os.Geteuid() != 0 {
 		return fmt.Errorf("pfd must run as root")
 	}
@@ -53,22 +58,32 @@ func RunPFD(ctx context.Context, logf func(string, ...any)) error {
 	if err != nil {
 		return fmt.Errorf("slot keeper: %w", err)
 	}
+	var restart <-chan struct{} // closed when an update wants this process replaced
+	if opts.SlotStatus != nil {
+		k.updater = newDaemonUpdater(opts.Version, opts.SlotStatus, logf)
+		restart = k.updater.run(ctx)
+	}
 	kl, err := listenKeeper(cfg)
 	if err != nil {
 		return fmt.Errorf("slot keeper socket: %w", err)
 	}
 	go k.serve(ctx, kl)
 
+	stop := func(why string) error {
+		d.load(base, true)
+		d.ports = 0
+		d.writeStatus()
+		logf("pf daemon stopping (%s); listener rules removed", why)
+		return nil
+	}
 	t := time.NewTicker(time.Second)
 	defer t.Stop()
 	for tick := 0; ; tick++ {
 		select {
 		case <-ctx.Done():
-			d.load(base, true)
-			d.ports = 0
-			d.writeStatus()
-			logf("pf daemon stopping; listener rules removed")
-			return nil
+			return stop("signal")
+		case <-restart:
+			return stop("restarting onto the updated binary")
 		case <-t.C:
 		}
 		ls, err := TCPListeners()

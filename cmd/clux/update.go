@@ -28,20 +28,6 @@ func updateNotice(current, latest string) string {
 	return fmt.Sprintf("clux %s is available (this is %s): run `clux update`", selfupdate.Tag(latest), current)
 }
 
-// nativeBehindNotice says the native runtime's daemons run an older clux
-// than `than` (their own root-owned copy, refreshed only by `sudo clux
-// native install`); "" when not installed or current.
-func nativeBehindNotice(than string) string {
-	if runtime.GOOS != "darwin" {
-		return ""
-	}
-	cfg, err := native.LoadConfig()
-	if err != nil || !selfupdate.Older(cfg.CLIVersion, than) {
-		return ""
-	}
-	return fmt.Sprintf("The native macOS runtime still runs clux %s (its own copy); refresh it with: sudo clux native install", cfg.CLIVersion)
-}
-
 // updater holds what `clux update` depends on, so tests can fake it.
 type updater struct {
 	current     string
@@ -56,8 +42,10 @@ type updater struct {
 	// restart restarts the background service if one is installed, and
 	// says what it did (or what the user must do).
 	restart func(out io.Writer)
-	// nativeBehind / nativeRefresh: the native runtime's copy of clux.
-	nativeBehind  func(than string) string
+	// native: the native runtime's own copy of clux (updated through its
+	// root daemon); nativeRefresh runs `sudo clux native install`, needed
+	// once for daemons too old to update themselves.
+	native        nativeDaemons
 	nativeRefresh func() error
 	in            io.Reader
 	out           io.Writer
@@ -82,7 +70,7 @@ func runUpdate(args []string) error {
 		},
 		sudoReplace:   sudoReplace,
 		restart:       restartBackgroundService,
-		nativeBehind:  nativeBehindNotice,
+		native:        installedNativeDaemons{},
 		nativeRefresh: sudoNativeInstall,
 		in:            os.Stdin,
 		out:           os.Stdout,
@@ -93,7 +81,7 @@ func runUpdate(args []string) error {
 func (u *updater) run(ctx context.Context, check bool, want string) error {
 	tag := selfupdate.Tag(want)
 	if tag != "" {
-		if _, ok := selfupdate.Parse(tag); !ok {
+		if !selfupdate.ValidTag(tag) {
 			return fmt.Errorf("--version %q is not a release version (e.g. v0.6.0)", want)
 		}
 	} else {
@@ -112,15 +100,19 @@ func (u *updater) run(ctx context.Context, check bool, want string) error {
 		} else {
 			fmt.Fprintf(u.out, "clux %s is up to date.\n", u.current)
 		}
-		if notice := u.nativeBehind(u.current); notice != "" {
-			fmt.Fprintln(u.out, notice)
+		if installed := u.native.Installed(); nativeBehind(installed, selfupdate.Tag(u.current), false) {
+			if native.CanSelfUpdate(installed) {
+				fmt.Fprintf(u.out, "The native macOS runtime runs clux %s; `clux update` updates it too.\n", installed)
+			} else {
+				fmt.Fprintln(u.out, nativeBootstrapNotice(installed))
+			}
 		}
 		return nil
 	}
 
 	if want == "" && !selfupdate.Older(u.current, tag) {
 		fmt.Fprintf(u.out, "clux %s is up to date.\n", u.current)
-		u.offerNativeRefresh(u.current)
+		u.syncNative(ctx, selfupdate.Tag(u.current), false)
 		return nil
 	}
 
@@ -136,9 +128,13 @@ func (u *updater) run(ctx context.Context, check bool, want string) error {
 	}
 
 	fmt.Fprintf(u.out, "Downloading clux %s for %s/%s...\n", tag, u.client.GOOS, u.client.GOARCH)
-	binary, err := u.client.Download(ctx, tag)
+	binary, signed, err := u.client.Download(ctx, tag, true)
 	if err != nil {
 		return err
+	}
+	if !signed {
+		fmt.Fprintf(u.out, "Warning: clux %s predates signed releases (%s); it was checked against its checksum only.\n",
+			tag, selfupdate.FirstSignedRelease)
 	}
 	if err := selfupdate.Replace(exe, binary, u.client.GOOS); err != nil {
 		var perm *selfupdate.PermissionError
@@ -156,20 +152,22 @@ func (u *updater) run(ctx context.Context, check bool, want string) error {
 		}
 	}
 	fmt.Fprintf(u.out, "Updated clux %s -> %s (%s).\n", u.current, tag, exe)
+	// The native daemons first: a restarted background service would ask
+	// for the same update concurrently.
+	u.syncNative(ctx, tag, want != "")
 	u.restart(u.out)
-	u.offerNativeRefresh(tag)
 	return nil
 }
 
-// offerNativeRefresh: the native daemons run their own copy of clux. On a
-// terminal, offer to refresh it now (sudo asks for the password); otherwise
-// print the command.
-func (u *updater) offerNativeRefresh(than string) {
-	notice := u.nativeBehind(than)
-	if notice == "" {
+// syncNative brings the native runtime's copy of clux to tag through its
+// root daemon. Daemons too old to do that need one `sudo clux native
+// install`: on a terminal it is offered right away (sudo asks for the
+// password); otherwise only the command is printed.
+func (u *updater) syncNative(ctx context.Context, tag string, explicit bool) {
+	say := func(format string, args ...any) { fmt.Fprintf(u.out, format+"\n", args...) }
+	if syncNativeDaemons(ctx, u.native, tag, explicit, say) != nativeBootstrap {
 		return
 	}
-	fmt.Fprintln(u.out, notice)
 	if !u.interactive || os.Geteuid() == 0 {
 		return
 	}

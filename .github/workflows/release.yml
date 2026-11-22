@@ -24,3 +24,13 @@ jobs:
           args: release --clean
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # ed25519 seed (base64) that signs checksums.txt; see README
+          # "Release signing".
+          CLUX_RELEASE_SIGNING_KEY: ${{ secrets.CLUX_RELEASE_SIGNING_KEY }}
+      - name: Verify the published signature
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p /tmp/sigcheck
+          gh release download "$GITHUB_REF_NAME" -D /tmp/sigcheck -p checksums.txt -p checksums.txt.sig
+          go run ./tools/releasesign verify -tag "$GITHUB_REF_NAME" -in /tmp/sigcheck/checksums.txt -sig /tmp/sigcheck/checksums.txt.sig

@@ -286,10 +286,13 @@ func (s *Server) handle(ctx context.Context, c *net.UnixConn) {
 		_ = c.SetWriteDeadline(time.Now().Add(10 * time.Second))
 		_, _ = c.Write(append(b, '\n'))
 	}
+	const denied = "permission denied: only the machine owner configured at install may use the native supervisor"
 	uid, err := peerUID(c)
-	if err != nil || uid != s.cfg.OwnerUID {
+	// Root (the pf daemon, which restarts idle supervisors after a
+	// self-update) may only ask for the status.
+	if err != nil || uid != s.cfg.OwnerUID && uid != 0 {
 		s.opts.Logf("rejected connection from uid %d (owner is %d) %v", uid, s.cfg.OwnerUID, err)
-		reply(Response{Error: "permission denied: only the machine owner configured at install may use the native supervisor"})
+		reply(Response{Error: denied})
 		return
 	}
 	_ = c.SetReadDeadline(time.Now().Add(30 * time.Second))
@@ -301,6 +304,11 @@ func (s *Server) handle(ctx context.Context, c *net.UnixConn) {
 	var req Request
 	if err := json.Unmarshal(line, &req); err != nil {
 		reply(Response{Error: "bad request: " + err.Error()})
+		return
+	}
+	if uid != s.cfg.OwnerUID && req.Op != OpStatus {
+		s.opts.Logf("rejected %s from uid %d (root may only ask for the status)", req.Op, uid)
+		reply(Response{Error: denied})
 		return
 	}
 	reply(s.Dispatch(ctx, req))

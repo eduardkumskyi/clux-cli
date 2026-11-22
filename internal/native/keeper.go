@@ -56,14 +56,21 @@ type KeeperRequest struct {
 	Op          string `json:"op"`
 	Slot        int    `json:"slot"`
 	WorkspaceID string `json:"workspace_id,omitempty"`
+	// Version / AllowDowngrade: KeeperOpUpdate's target release tag, and
+	// whether it may be older than the installed one.
+	Version        string `json:"version,omitempty"`
+	AllowDowngrade bool   `json:"allow_downgrade,omitempty"`
 }
 
 // KeeperResponse is the reply to a KeeperRequest.
 type KeeperResponse struct {
-	OK         bool       `json:"ok"`
-	Error      string     `json:"error,omitempty"`
-	State      *SlotState `json:"state,omitempty"`
-	FreedBytes int64      `json:"freed_bytes,omitempty"`
+	OK         bool          `json:"ok"`
+	Error      string        `json:"error,omitempty"`
+	State      *SlotState    `json:"state,omitempty"`
+	FreedBytes int64         `json:"freed_bytes,omitempty"`
+	Update     *UpdateResult `json:"update,omitempty"`
+	// Version: KeeperOpVersion's answer.
+	Version string `json:"version,omitempty"`
 }
 
 // claimSlot is the claim rule: a workspace may take a slot that is free,

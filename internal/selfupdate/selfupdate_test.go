@@ -114,7 +114,7 @@ func TestLatestAndVerifiedDownload(t *testing.T) {
 	if err != nil || tag != "v0.6.0" {
 		t.Fatalf("Latest = %q, %v", tag, err)
 	}
-	got, err := c.Download(context.Background(), tag)
+	got, _, err := c.Download(context.Background(), tag, true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -127,7 +127,7 @@ func TestDownloadRejectsAChecksumMismatch(t *testing.T) {
 	archive := tarGz(t, map[string][]byte{"clux": []byte("tampered")})
 	c := fakeGitHub(t, "v0.6.0", map[string][]byte{"clux_darwin_arm64.tar.gz": archive},
 		strings.Repeat("a", 64)+"  clux_darwin_arm64.tar.gz\n")
-	if _, err := c.Download(context.Background(), "v0.6.0"); err == nil || !strings.Contains(err.Error(), "does not match") {
+	if _, _, err := c.Download(context.Background(), "v0.6.0", true); err == nil || !strings.Contains(err.Error(), "does not match") {
 		t.Fatalf("want a checksum error, got %v", err)
 	}
 }
@@ -135,10 +135,10 @@ func TestDownloadRejectsAChecksumMismatch(t *testing.T) {
 func TestDownloadNeedsAChecksumEntryAndTheAsset(t *testing.T) {
 	archive := tarGz(t, map[string][]byte{"clux": []byte("x")})
 	c := fakeGitHub(t, "v0.6.0", map[string][]byte{"clux_darwin_arm64.tar.gz": archive}, "")
-	if _, err := c.Download(context.Background(), "v0.6.0"); err == nil || !strings.Contains(err.Error(), "no entry") {
+	if _, _, err := c.Download(context.Background(), "v0.6.0", true); err == nil || !strings.Contains(err.Error(), "no entry") {
 		t.Fatalf("want a missing-entry error, got %v", err)
 	}
-	if _, err := c.Download(context.Background(), "v9.9.9"); err == nil || !strings.Contains(err.Error(), "not found") {
+	if _, _, err := c.Download(context.Background(), "v9.9.9", true); err == nil || !strings.Contains(err.Error(), "not found") {
 		t.Fatalf("want not found, got %v", err)
 	}
 }
@@ -147,7 +147,7 @@ func TestWindowsZipIsExtracted(t *testing.T) {
 	archive := zipped(t, "clux.exe", []byte("exe"))
 	c := fakeGitHub(t, "v0.6.0", map[string][]byte{"clux_windows_amd64.zip": archive}, sum(archive)+"  clux_windows_amd64.zip\n")
 	c.GOOS, c.GOARCH = "windows", "amd64"
-	got, err := c.Download(context.Background(), "v0.6.0")
+	got, _, err := c.Download(context.Background(), "v0.6.0", true)
 	if err != nil || string(got) != "exe" {
 		t.Fatalf("got %q, %v", got, err)
 	}

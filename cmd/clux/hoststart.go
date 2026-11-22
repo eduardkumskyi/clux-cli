@@ -23,6 +23,7 @@ import (
 	"github.com/eduardkumskyi/clux-cli/internal/logx"
 	"github.com/eduardkumskyi/clux-cli/internal/native"
 	"github.com/eduardkumskyi/clux-cli/internal/netwatch"
+	"github.com/eduardkumskyi/clux-cli/internal/selfupdate"
 	"github.com/eduardkumskyi/clux-cli/internal/service"
 	"github.com/eduardkumskyi/clux-cli/internal/sysinfo"
 	"github.com/eduardkumskyi/clux-cli/internal/tunnel"
@@ -216,14 +217,16 @@ func runHostStart(args []string) error {
 	// macOS: offer the native runtime once (interactive only), or warn if
 	// it is installed but unhealthy. Never blocks docker-only mode.
 	newNativeOffer(cfg, *noNativePrompt, log.Printf).run()
-	if notice := nativeBehindNotice(version); notice != "" {
-		logger.Printf("%s", notice)
-	}
 
 	if bg.run() {
 		logger.Printf("handed over to the background service")
 		return nil
 	}
+
+	// The native daemons follow this CLI: if they run an older clux, their
+	// root daemon updates itself now, before workspaces are taken (only an
+	// upgrade; a failure is logged and never stops the host).
+	syncNativeDaemons(ctx, installedNativeDaemons{}, selfupdate.Tag(version), false, logger.Printf)
 
 	h := newHostLoop(creds, *interval, logger)
 	h.caps = &native.Capabilities{Supervisor: func(ctx context.Context) (string, string, error) {
