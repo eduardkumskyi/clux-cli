@@ -166,9 +166,19 @@ func TestReplaceSwapsTheFileAndLeavesNoTemp(t *testing.T) {
 	if string(data) != "new" || runtime.GOOS != "windows" && st.Mode().Perm() != 0o755 {
 		t.Fatalf("got %q mode %v", data, st.Mode())
 	}
+	// On Windows the replaced .exe is moved aside to exe+".old" by design.
+	want := map[string]bool{"clux": true}
+	if runtime.GOOS == "windows" {
+		want["clux.old"] = true
+	}
 	entries, _ := os.ReadDir(dir)
-	if len(entries) != 1 {
-		t.Fatalf("leftovers: %v", entries)
+	for _, e := range entries {
+		if !want[e.Name()] {
+			t.Fatalf("leftovers: %v", entries)
+		}
+	}
+	if len(entries) != len(want) {
+		t.Fatalf("entries %v, want %v", entries, want)
 	}
 }
 
