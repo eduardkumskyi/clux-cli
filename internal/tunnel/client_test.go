@@ -99,6 +99,7 @@ func newFakeBackend(t *testing.T, mode string) *fakeBackend {
 			time.Sleep(50 * time.Millisecond)
 			_ = c.WriteJSON(map[string]any{"type": "egress.decision", "workspace_id": 7, "request_id": "r1", "decision": "deny"})
 			_ = c.WriteJSON(map[string]any{"type": "egress.policy", "workspace_id": 7, "mode": "open", "allow": []string{}})
+			_ = c.WriteJSON(map[string]any{"type": "host_exec.run", "correlation_id": "c1", "workspace_id": 7})
 			for {
 				if _, _, err := c.ReadMessage(); err != nil {
 					return
