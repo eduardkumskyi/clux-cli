@@ -632,7 +632,7 @@ func (s *Session) readLoop(ctx context.Context, h Handler) error {
 			// No-op: heartbeats don't block waiting for their ack anymore,
 			// and register_ack was already consumed by Dial.
 		case "workspace.start", "workspace.stop", "workspace.delete",
-			"egress.policy", "egress.decision":
+			"egress.policy", "egress.decision", "host_exec.run":
 			go h.HandleCommand(ctx, frameType, raw)
 		case "dial.open":
 			streamID, _ := raw["stream_id"].(string)

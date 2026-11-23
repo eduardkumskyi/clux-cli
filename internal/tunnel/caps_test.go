@@ -138,20 +138,22 @@ func TestHeartbeatCapabilitiesOnlyWhenGiven(t *testing.T) {
 	}
 }
 
-func TestEgressFramesReachHandleCommand(t *testing.T) {
+// A command frame missing from the reader's list is dropped silently and the
+// backend times out waiting for its ack (host_exec.run in v0.8.0).
+func TestCommandFramesReachHandleCommand(t *testing.T) {
 	fb := newFakeBackend(t, "egress")
 	sess := dialFake(t, fb)
 	h := recordingHandler{got: make(chan string, 4)}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	go sess.Run(ctx, h)
-	want := map[string]bool{"egress.decision": true, "egress.policy": true}
-	for i := 0; i < 2; i++ {
+	want := map[string]bool{"egress.decision": true, "egress.policy": true, "host_exec.run": true}
+	for i := 0; i < 3; i++ {
 		select {
 		case ft := <-h.got:
 			delete(want, ft)
 		case <-time.After(3 * time.Second):
-			t.Fatalf("egress frames not dispatched, still missing %v", want)
+			t.Fatalf("command frames not dispatched, still missing %v", want)
 		}
 	}
 	if len(want) != 0 {
